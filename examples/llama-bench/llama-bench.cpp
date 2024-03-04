@@ -602,6 +602,7 @@ struct test {
     static const bool sycl;
     static const bool gpu_blas;
     static const bool blas;
+    static const bool directml;
     static const std::string cpu_info;
     static const std::string gpu_info;
     std::string model_filename;
@@ -700,6 +701,9 @@ struct test {
         if (blas) {
             return "BLAS";
         }
+        if (directml) {
+            return "DirectML";
+        }
 
         return "CPU";
     }
@@ -707,7 +711,7 @@ struct test {
     static const std::vector<std::string> & get_fields() {
         static const std::vector<std::string> fields = {
             "build_commit", "build_number",
-            "cuda", "opencl", "vulkan", "kompute", "metal", "sycl", "gpu_blas", "blas",
+            "cuda", "opencl", "vulkan", "kompute", "metal", "sycl", "gpu_blas", "blas", "directml",
             "cpu_info", "gpu_info",
             "model_filename", "model_type", "model_size", "model_n_params",
             "n_batch", "n_threads", "type_k", "type_v",
@@ -732,8 +736,8 @@ struct test {
             return INT;
         }
         if (field == "cuda" || field == "opencl"  || field == "vulkan" || field == "kompute" || field == "metal" ||
-            field == "gpu_blas" || field == "blas" || field == "sycl" ||field == "f16_kv" || field == "no_kv_offload" ||
-            field == "mul_mat_q" || field == "use_mmap") {
+            field == "gpu_blas" || field == "blas" || field == "directml" || field == "sycl" ||field == "f16_kv" ||
+            field == "no_kv_offload" || field == "mul_mat_q" || field == "use_mmap") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -761,7 +765,7 @@ struct test {
         std::vector<std::string> values = {
             build_commit, std::to_string(build_number),
             std::to_string(cuda), std::to_string(opencl), std::to_string(vulkan), std::to_string(vulkan),
-            std::to_string(metal), std::to_string(sycl), std::to_string(gpu_blas), std::to_string(blas),
+            std::to_string(metal), std::to_string(sycl), std::to_string(gpu_blas), std::to_string(blas), std::to_string(directml),
             cpu_info, gpu_info,
             model_filename, model_type, std::to_string(model_size), std::to_string(model_n_params),
             std::to_string(n_batch), std::to_string(n_threads), ggml_type_name(type_k), ggml_type_name(type_v),
@@ -795,6 +799,7 @@ const bool        test::metal        = !!ggml_cpu_has_metal();
 const bool        test::gpu_blas     = !!ggml_cpu_has_gpublas();
 const bool        test::blas         = !!ggml_cpu_has_blas();
 const bool        test::sycl         = !!ggml_cpu_has_sycl();
+const bool        test::directml     = !!ggml_cpu_has_directml();
 const std::string test::cpu_info     = get_cpu_info();
 const std::string test::gpu_info     = get_gpu_info();
 

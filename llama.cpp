@@ -17,6 +17,8 @@
 #  include "ggml-sycl.h"
 #elif defined(GGML_USE_KOMPUTE)
 #   include "ggml-kompute.h"
+#elif defined(GGML_USE_DIRECTML)
+#   include "ggml-directml.h"
 #endif
 
 #ifdef GGML_USE_METAL
@@ -1444,6 +1446,8 @@ static ggml_backend_buffer_type_t llama_default_buffer_type_offload(int gpu) {
     if (buft == nullptr) {
         LLAMA_LOG_WARN("%s: cannot use GPU %d, check `vulkaninfo --summary`\n", __func__, gpu);
     }
+#elif defined(GGML_USE_DIRECTML)
+    buft = ggml_backend_directml_buffer_type(gpu);
 #endif
 
     if (buft == nullptr) {
@@ -11604,7 +11608,7 @@ struct llama_model_params llama_model_default_params() {
         /*.use_mlock                   =*/ false,
     };
 
-#ifdef GGML_USE_METAL
+#if defined(GGML_USE_METAL) || defined(GGML_USE_DIRECTML)
     // note: we usually have plenty of VRAM, so by default offload all layers to the GPU
     result.n_gpu_layers = 999;
 #endif
@@ -11680,7 +11684,7 @@ bool llama_supports_mlock(void) {
 
 bool llama_supports_gpu_offload(void) {
 #if defined(GGML_USE_CUBLAS) || defined(GGML_USE_CLBLAST) || defined(GGML_USE_METAL) || defined(GGML_USE_VULKAN) || \
-    defined(GGML_USE_SYCL)   || defined(GGML_USE_KOMPUTE)
+    defined(GGML_USE_SYCL)   || defined(GGML_USE_KOMPUTE) || defined(GGML_USE_DIRECTML)
     // Defined when llama.cpp is compiled with support for offloading model layers to GPU.
     return true;
 #else
@@ -11890,6 +11894,16 @@ struct llama_context * llama_new_context_with_model(
 #elif defined(GGML_USE_KOMPUTE)
         if (model->n_gpu_layers > 0) {
             auto * backend = ggml_backend_kompute_init(model->main_gpu);
+            if (backend == nullptr) {
+                LLAMA_LOG_ERROR("%s: failed to initialize Kompute backend\n", __func__);
+                llama_free(ctx);
+                return nullptr;
+            }
+            ctx->backends.push_back(backend);
+        }
+#elif defined(GGML_USE_DIRECTML)
+        if (model->n_gpu_layers > 0) {
+            auto * backend = ggml_backend_directml_init(model->main_gpu);
             if (backend == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to initialize Kompute backend\n", __func__);
                 llama_free(ctx);

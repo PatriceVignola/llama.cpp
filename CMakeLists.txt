@@ -117,6 +117,7 @@ option(LLAMA_QKK_64                          "llama: use super-block size of 64 
 option(LLAMA_SYCL                            "llama: use SYCL"                                  OFF)
 option(LLAMA_SYCL_F16                        "llama: use 16 bit floats for sycl calculations"   OFF)
 option(LLAMA_CPU_HBM                         "llama: use memkind for CPU HBM"                   OFF)
+option(LLAMA_DIRECTML                        "llama: use DirectML"                              OFF)
 
 option(LLAMA_BUILD_TESTS                     "llama: build tests"    ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES                  "llama: build examples" ${LLAMA_STANDALONE})
@@ -721,6 +722,116 @@ if (LLAMA_KOMPUTE)
     endif()
 endif()
 
+if (LLAMA_DIRECTML)
+    message("-- Using DirectML")
+
+    if (NOT(MSVC) OR NOT(WIN32))
+        message(FATAL_ERROR "NuGet packages are only supported for MSVC on Windows.")
+    endif()
+
+    # Retrieve the latest version of nuget
+    include(ExternalProject)
+    ExternalProject_Add(nuget
+        PREFIX nuget
+        URL "https://dist.nuget.org/win-x86-commandline/v5.3.0/nuget.exe"
+        DOWNLOAD_NO_EXTRACT 1
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ""
+        UPDATE_COMMAND ""
+        INSTALL_COMMAND "")
+
+    set(NUGET_CONFIG ${PROJECT_SOURCE_DIR}/directml/nuget.config)
+    set(PACKAGES_CONFIG ${PROJECT_SOURCE_DIR}/directml/packages.config)
+    get_filename_component(PACKAGES_DIR ${CMAKE_CURRENT_BINARY_DIR}/packages ABSOLUTE)
+    set(DML_PACKAGE_DIR ${PACKAGES_DIR}/Microsoft.AI.DirectML.1.13.1)
+
+    # Restore nuget packages, which will pull down the DirectML redist package.
+    add_custom_command(
+        OUTPUT
+        ${DML_PACKAGE_DIR}/bin/x64-win/DirectML.lib
+        DEPENDS
+        ${PACKAGES_CONFIG}
+        ${NUGET_CONFIG}
+        COMMAND ${CMAKE_CURRENT_BINARY_DIR}/nuget/src/nuget restore ${PACKAGES_CONFIG} -PackagesDirectory ${PACKAGES_DIR} -ConfigFile ${NUGET_CONFIG}
+        VERBATIM
+    )
+
+    add_custom_target(
+        RESTORE_PACKAGES ALL
+        DEPENDS
+        ${DML_PACKAGE_DIR}/bin/x64-win/DirectML.lib
+    )
+
+    add_dependencies(RESTORE_PACKAGES nuget)
+
+    # Fetch WIL and DirectX-Headers
+    set(WIL_BUILD_PACKAGING OFF CACHE BOOL "" FORCE)
+    set(WIL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+
+    include(FetchContent)
+    FetchContent_Declare(
+        microsoft_wil
+        URL https://github.com/microsoft/wil/archive/refs/tags/v1.0.230629.1.zip
+        URL_HASH SHA1=e4a542a323c070376f7c2d1973d0f7ddbc1d2fa5
+        FIND_PACKAGE_ARGS NAMES wil
+    )
+
+    FetchContent_Declare(
+        directmlx
+        URL https://raw.githubusercontent.com/microsoft/DirectML/48c6d4df0098391930a137e72a887d8dcdc9300a/Libraries/DirectMLX.h
+        DOWNLOAD_NO_EXTRACT 1
+    )
+
+    FetchContent_Declare(
+        directx_headers
+        GIT_REPOSITORY https://github.com/microsoft/DirectX-Headers
+        GIT_TAG d49ae12ab350b20468a9667bad700f3227cd3f7a
+    )
+
+    FetchContent_MakeAvailable(microsoft_wil directx_headers directmlx)
+
+    set(GGML_HEADERS_DIRECTML
+        ggml-directml.cpp
+        ggml-directml.h
+        dml_optional_extensions.h
+        directml/dml-allocation-info.cpp
+        directml/dml-allocation-info.h
+        directml/dml-allocator-rounding-mode.h
+        directml/dml-buffer-region.cpp
+        directml/dml-buffer-region.h
+        directml/dml-buffer.cpp
+        directml/dml-buffer.h
+        directml/dml-command-queue.cpp
+        directml/dml-command-queue.h
+        directml/dml-command-recorder.cpp
+        directml/dml-command-recorder.h
+        directml/dml-descriptor-pool.cpp
+        directml/dml-descriptor-pool.h
+        directml/dml-execution-context.cpp
+        directml/dml-execution-context.h
+        directml/dml-gpu-allocator.cpp
+        directml/dml-gpu-allocator.h
+        directml/dml-gpu-event.h
+        directml/dml-heap-allocation.h
+        directml/dml-managed-buffer.h
+        directml/dml-pooled-upload-heap.cpp
+        directml/dml-pooled-upload-heap.h
+        directml/dml-readback-heap.cpp
+        directml/dml-readback-heap.h
+        directml/dml-reserved-resource-allocator-wrapper.h
+        directml/dml-reserved-resource-sub-allocator.cpp
+        directml/dml-reserved-resource-sub-allocator.h
+        directml/dml-reserved-resource-wrapper.h
+        directml/dml-resource-wrapper.h
+        directml/dml-sub-allocator.h
+        directml/dml-tagged-pointer.cpp
+        directml/dml-tagged-pointer.h
+    )
+    set(LLAMA_EXTRA_INCLUDES ${LLAMA_EXTRA_INCLUDES} "${DML_PACKAGE_DIR}" "${directx_headers_SOURCE_DIR}/include/directx" "${directmlx_SOURCE_DIR}")
+    set(LLAMA_EXTRA_LIBS ${LLAMA_EXTRA_LIBS} ${DML_PACKAGE_DIR}/bin/x64-win/DirectML.lib WIL::WIL dxcore.lib dxguid.lib d3d12.lib dxgi.lib)
+    add_compile_definitions(GGML_USE_DIRECTML)
+endif()
+
 if (LLAMA_CPU_HBM)
     find_library(memkind memkind REQUIRED)
 
@@ -1098,15 +1209,16 @@ add_library(ggml OBJECT
             ggml-backend.h
             ggml-quants.c
             ggml-quants.h
-            ${GGML_SOURCES_CUDA}    ${GGML_HEADERS_CUDA}
-            ${GGML_SOURCES_OPENCL}  ${GGML_HEADERS_OPENCL}
-            ${GGML_SOURCES_METAL}   ${GGML_HEADERS_METAL}
-            ${GGML_SOURCES_MPI}     ${GGML_HEADERS_MPI}
-            ${GGML_SOURCES_EXTRA}   ${GGML_HEADERS_EXTRA}
-            ${GGML_SOURCES_SYCL}    ${GGML_HEADERS_SYCL}
-            ${GGML_SOURCES_KOMPUTE} ${GGML_HEADERS_KOMPUTE}
-            ${GGML_SOURCES_VULKAN}  ${GGML_HEADERS_VULKAN}
-            ${GGML_SOURCES_ROCM}    ${GGML_HEADERS_ROCM}
+            ${GGML_SOURCES_CUDA}     ${GGML_HEADERS_CUDA}
+            ${GGML_SOURCES_OPENCL}   ${GGML_HEADERS_OPENCL}
+            ${GGML_SOURCES_METAL}    ${GGML_HEADERS_METAL}
+            ${GGML_SOURCES_MPI}      ${GGML_HEADERS_MPI}
+            ${GGML_SOURCES_EXTRA}    ${GGML_HEADERS_EXTRA}
+            ${GGML_SOURCES_SYCL}     ${GGML_HEADERS_SYCL}
+            ${GGML_SOURCES_KOMPUTE}  ${GGML_HEADERS_KOMPUTE}
+            ${GGML_SOURCES_VULKAN}   ${GGML_HEADERS_VULKAN}
+            ${GGML_SOURCES_ROCM}     ${GGML_HEADERS_ROCM}
+            ${GGML_SOURCES_DIRECTML} ${GGML_HEADERS_DIRECTML}
             )
 
 target_include_directories(ggml PUBLIC . ${LLAMA_EXTRA_INCLUDES})
@@ -1115,6 +1227,11 @@ target_compile_features   (ggml PUBLIC c_std_11) # don't bump
 target_link_libraries(ggml PUBLIC Threads::Threads ${LLAMA_EXTRA_LIBS})
 
 add_library(ggml_static STATIC $<TARGET_OBJECTS:ggml>)
+
+if (LLAMA_DIRECTML)
+    add_dependencies(ggml_static RESTORE_PACKAGES)
+    target_link_libraries(ggml_static PRIVATE "${DML_PACKAGE_DIR}/bin/x64-win/DirectML.lib" "${DML_PACKAGE_DIR}/bin/x64-win/DirectML.dll")
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(ggml PROPERTIES POSITION_INDEPENDENT_CODE ON)

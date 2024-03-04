@@ -21252,4 +21252,12 @@ int ggml_cpu_has_matmul_int8(void) {
 #endif
 }
 
+int ggml_cpu_has_directml(void) {
+#if defined(GGML_USE_DIRECTML)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 ////////////////////////////////////////////////////////////////////////////////

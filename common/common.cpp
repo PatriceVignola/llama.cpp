@@ -1637,6 +1637,7 @@ void dump_non_result_info_yaml(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "cpu_has_sse3: %s\n",        ggml_cpu_has_sse3()        ? "true" : "false");
     fprintf(stream, "cpu_has_vsx: %s\n",         ggml_cpu_has_vsx()         ? "true" : "false");
     fprintf(stream, "cpu_has_matmul_int8: %s\n", ggml_cpu_has_matmul_int8() ? "true" : "false");
+    fprintf(stream, "cpu_has_directml: %s\n",    ggml_cpu_has_directml()    ? "true" : "false");
 
 #ifdef NDEBUG
     fprintf(stream, "debug: false\n");

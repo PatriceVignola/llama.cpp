@@ -265,8 +265,6 @@ namespace Dml
                 // This allocation doesn't belong to this allocator!
                 THROW_HR(E_INVALIDARG);
             }
-
-            m_context->QueueReference(allocInfo);
         }
     }
 

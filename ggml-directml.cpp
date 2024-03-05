@@ -362,7 +362,7 @@ static ggml_backend_buffer_type_i ggml_backend_directml_buffer_type_interface = 
 ggml_backend_buffer_type_t ggml_backend_directml_buffer_type(int device) {
     static ggml_backend_buffer_type buffer_type = {
         /* .iface   = */ ggml_backend_directml_buffer_type_interface,
-        /* .context = */ new ggml_backend_directml_buffer_type_context(device, 4, UINT64_MAX)
+        /* .context = */ new ggml_backend_directml_buffer_type_context(device, 4, UINT32_MAX)
     };
 
     return &buffer_type;
@@ -792,7 +792,6 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         const std::vector<ggml_tensor*> current_operator_outputs = operator_outputs[operator_index];
 
         Microsoft::WRL::ComPtr<IDMLCompiledOperator> compiled_op = dml_graphs[operator_index].Compile(DML_EXECUTION_FLAG_NONE, {dml_operators[operator_index]});
-        ComPtr<ID3D12Resource> persistentResource;
         DML_BUFFER_BINDING persistentResourceBinding;
         ComPtr<Dml::DmlManagedBuffer> managedPersistentBuffer;
         DML_BINDING_DESC persistentResourceBindingDesc{};
@@ -801,11 +800,13 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         if (persistentResourceSize > 0)
         {
             auto buffer = s_directml_context->allocator->AllocateDefaultBuffer(persistentResourceSize, Dml::AllocatorRoundingMode::Disabled);
+            ComPtr<ID3D12Resource> persistentResource;
             persistentResource = buffer.GetD3D12Resource();
             persistentResourceBinding = buffer.GetBufferBinding();
             managedPersistentBuffer = wil::MakeOrThrow<Dml::DmlManagedBuffer>(std::move(buffer));
-            s_directml_context->execution_context->QueueReference(managedPersistentBuffer.Get());
             persistentResourceBindingDesc = DML_BINDING_DESC{ DML_BINDING_TYPE_BUFFER, &persistentResourceBinding };
+            s_directml_context->execution_context->QueueReference(managedPersistentBuffer.Get());
+            s_directml_context->execution_context->QueueReference(persistentResource.Get());
         }
 
         DML_BINDING_DESC initInputBindings{};
@@ -817,7 +818,6 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 
         // Queue references to objects which must be kept alive until resulting GPU work completes
         s_directml_context->execution_context->QueueReference(compiled_op.Get());
-        s_directml_context->execution_context->QueueReference(persistentResource.Get());
 
         auto FillBindingsFromBuffers = [](auto& bufferBindings, auto& bindingDescs, std::vector<Dml::D3D12BufferRegion>& bufferRegions)
         {

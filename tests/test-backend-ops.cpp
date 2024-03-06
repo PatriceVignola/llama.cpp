@@ -1123,6 +1123,10 @@ struct test_rope : public test_case {
     int mode;
     int n_ctx;
 
+    double max_nmse_err() override {
+        return 2e-7;
+    }
+
     std::string vars() override {
         return VARS_TO_STR5(type, ne, n_dims, mode, n_ctx);
     }

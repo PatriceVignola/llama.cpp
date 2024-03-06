@@ -1,3 +1,5 @@
+#define NOMINMAX
+
 #include <vector>
 #include <string>
 #include <memory>
@@ -8,6 +10,7 @@
 #include <unordered_set>
 #include "ggml-directml.h"
 #include "ggml-backend-impl.h"
+#include "ggml-impl.h"
 
 #define DML_TARGET_VERSION 0x6300
 
@@ -362,7 +365,7 @@ static ggml_backend_buffer_type_i ggml_backend_directml_buffer_type_interface = 
 ggml_backend_buffer_type_t ggml_backend_directml_buffer_type(int device) {
     static ggml_backend_buffer_type buffer_type = {
         /* .iface   = */ ggml_backend_directml_buffer_type_interface,
-        /* .context = */ new ggml_backend_directml_buffer_type_context(device, 4, UINT32_MAX)
+        /* .context = */ new ggml_backend_directml_buffer_type_context(device, DML_MINIMUM_BUFFER_TENSOR_ALIGNMENT, UINT32_MAX)
     };
 
     return &buffer_type;
@@ -488,12 +491,12 @@ static dml::Expression create_matmul(dml::Graph& scope, const std::vector<dml::E
     auto bTensor = node_inputs[0];
 
     // TODO (pavignol): Instead of doing this, cast all fp32 weights once at the beginning and use only fp16 tensors in the graph
-    if (aTensor.GetOutputDesc().dataType != bTensor.GetOutputDesc().dataType) {
-        if (aTensor.GetOutputDesc().dataType == DML_TENSOR_DATA_TYPE_FLOAT32) {
-            aTensor = dml::Cast(aTensor, DML_TENSOR_DATA_TYPE_FLOAT16);
-        } else {
-            bTensor = dml::Cast(aTensor, DML_TENSOR_DATA_TYPE_FLOAT16);
-        }
+    if (aTensor.GetOutputDesc().dataType != output_tensor_desc.dataType) {
+        aTensor = dml::Cast(aTensor, output_tensor_desc.dataType);
+    }
+
+    if (bTensor.GetOutputDesc().dataType != output_tensor_desc.dataType) {
+        bTensor = dml::Cast(bTensor, output_tensor_desc.dataType);
     }
 
     auto result = dml::Gemm(aTensor, bTensor, NullOpt, DML_MATRIX_TRANSFORM_NONE, DML_MATRIX_TRANSFORM_TRANSPOSE);
@@ -533,24 +536,38 @@ static dml::Expression create_copy(dml::Graph& scope, const std::vector<dml::Exp
 
 static dml::Expression create_add(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
     GGML_ASSERT(node_inputs.size() == 2);
-    return node_inputs[0] + node_inputs[1];
+
+    auto a_tensor = node_inputs[0];
+    auto b_tensor = node_inputs[1];
+    std::tie(a_tensor, b_tensor) = broadcast_tensors(a_tensor, b_tensor);
+    return a_tensor + b_tensor;
 }
 
-static dml::Expression create_softmax(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc, float scale) {
-    GGML_ASSERT(node_inputs.size() == 2);
+static dml::Expression create_softmax(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc, float scale, float max_bias) {
+    GGML_ASSERT(node_inputs.size() == 1 || node_inputs.size() == 2);
+    GGML_ASSERT(max_bias == 0.0f);
 
     auto input = node_inputs[0];
-    auto mask = node_inputs[1];
-
-    if (mask.GetOutputDesc().dataType != input.GetOutputDesc().dataType) {
-        mask = dml::Cast(mask, input.GetOutputDesc().dataType);
-    }
-
-    std::tie(input, mask) = broadcast_tensors(input, mask);
     std::array<uint32_t, 1> axes = {input.GetOutputDesc().sizes.size() - 1};
 
-    auto result = dml::ActivationSoftmax(input * scale + mask, axes);
-    return result;
+    if (node_inputs.size() == 2) {
+        const auto& input_sizes = input.GetOutputDesc().sizes;
+        auto mask = node_inputs[1];
+
+        if (mask.GetOutputDesc().dataType != input.GetOutputDesc().dataType) {
+            mask = dml::Cast(mask, input.GetOutputDesc().dataType);
+        }
+
+        std::tie(input, mask) = broadcast_tensors(input, mask);
+        auto result = dml::ActivationSoftmax(input * scale + mask, axes);
+        return result;
+    }
+
+    if (scale != 1.0f) {
+        return dml::ActivationSoftmax(input * scale, axes);
+    }
+
+    return dml::ActivationSoftmax(input, axes);
 }
 
 static dml::Expression create_relu(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
@@ -568,6 +585,252 @@ static dml::Expression create_silu(dml::Graph& scope, const std::vector<dml::Exp
     return node_inputs[0] * dml::ActivationSigmoid(node_inputs[0]);
 }
 
+static dml::Expression create_abs(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
+    GGML_ASSERT(node_inputs.size() == 1);
+    return dml::Abs(node_inputs[0]);
+}
+
+static dml::Expression create_neg(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
+    GGML_ASSERT(node_inputs.size() == 1);
+    return -node_inputs[0];
+}
+
+static dml::Expression create_tanh(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
+    GGML_ASSERT(node_inputs.size() == 1);
+    return dml::Tanh(node_inputs[0]);
+}
+
+static dml::Expression create_elu(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
+    GGML_ASSERT(node_inputs.size() == 1);
+    return dml::ActivationElu(node_inputs[0]);
+}
+
+static dml::Expression create_hardsigmoid(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
+    GGML_ASSERT(node_inputs.size() == 1);
+    return dml::ActivationHardSigmoid(node_inputs[0], 1.0f/6.0f);
+}
+
+static dml::Expression create_hardswish(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
+    GGML_ASSERT(node_inputs.size() == 1);
+    return node_inputs[0] * dml::ActivationHardSigmoid(node_inputs[0], 1.0f/6.0f);
+}
+
+static DML_SCALAR_UNION generate_scalar_union(DML_TENSOR_DATA_TYPE dtype, double value) {
+    DML_SCALAR_UNION scalar{};
+
+    switch (dtype)
+    {
+    case DML_TENSOR_DATA_TYPE_INT8:
+        scalar.Int8 = static_cast<int8_t>(value);
+        break;
+
+    case DML_TENSOR_DATA_TYPE_UINT8:
+        scalar.UInt8 = static_cast<uint8_t>(value);
+        break;
+
+    case DML_TENSOR_DATA_TYPE_INT16:
+        scalar.Int16 = static_cast<int16_t>(value);
+        break;
+
+    case DML_TENSOR_DATA_TYPE_UINT16:
+        scalar.UInt16 = static_cast<uint16_t>(value);
+        break;
+
+    case DML_TENSOR_DATA_TYPE_INT32:
+        scalar.Int32 = static_cast<int32_t>(value);
+        break;
+
+    case DML_TENSOR_DATA_TYPE_UINT32:
+        scalar.UInt32 = static_cast<uint32_t>(value);
+        break;
+
+    case DML_TENSOR_DATA_TYPE_INT64:
+        scalar.Int64 = static_cast<int64_t>(value);
+        break;
+
+    case DML_TENSOR_DATA_TYPE_UINT64:
+        scalar.UInt64 = static_cast<uint64_t>(value);
+        break;
+
+    case DML_TENSOR_DATA_TYPE_FLOAT32:
+        scalar.Float32 = static_cast<float>(value);
+        break;
+
+    case DML_TENSOR_DATA_TYPE_FLOAT64:
+        scalar.Float64 = static_cast<double>(value);
+        break;
+
+    case DML_TENSOR_DATA_TYPE_FLOAT16: {
+        ggml_fp16_t float16_value = GGML_COMPUTE_FP32_TO_FP16(value);
+        const BYTE* float16_bytes = reinterpret_cast<const BYTE*>(&float16_value);
+        std::copy(float16_bytes, float16_bytes + sizeof(float16_value), scalar.Bytes);
+    }
+    break;
+
+    default:
+        THROW_HR(E_NOTIMPL);
+    }
+
+    return scalar;
+}
+
+static dml::Expression sequence_tensor(dml::Graph& scope, double start, double step,  DML_TENSOR_DATA_TYPE dtype, const dml::TensorDimensions& sizes)
+{
+    dml::TensorDesc::Dimensions scalar_dims(sizes.size(), 1);
+    dml::TensorDesc::Dimensions scalar_strides(sizes.size(), 0);
+
+    auto start_scalar = generate_scalar_union(dtype, start);
+    auto step_scalar = generate_scalar_union(dtype, step);
+    auto sequence = dml::FillValueSequence(scope, sizes, dtype, start_scalar, step_scalar);
+    return sequence;
+}
+
+static dml::Expression scalar_tensor(dml::Graph& scope, double value, DML_TENSOR_DATA_TYPE dtype, const dml::TensorDimensions& sizes)
+{
+    dml::TensorDesc::Dimensions scalar_dims(sizes.size(), 1);
+    dml::TensorDesc::Dimensions scalar_strides(sizes.size(), 0);
+
+    auto scalar = generate_scalar_union(dtype, value);
+
+    auto constant_scalar = dml::Reinterpret(
+        dml::FillValueConstant(
+            scope,
+            scalar_dims,
+            dtype,
+            scalar),
+        sizes,         /* broadcast shape */
+        scalar_strides /* broadcast strides */
+    );
+    return constant_scalar;
+}
+
+static dml::Expression create_signum(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
+    GGML_ASSERT(node_inputs.size() == 1);
+    return dml::Sign(node_inputs[0]);
+}
+
+static dml::Expression create_step(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
+    GGML_ASSERT(node_inputs.size() == 1);
+    return dml::Clip(dml::Sign(node_inputs[0]), 0.0f, 1.0f);
+}
+
+static dml::Expression rope_yarn_ramp(dml::Graph& scope, const float low, const float high, dml::Expression pos_range) {
+    const auto y = (pos_range / 2 - low) / std::max(0.001f, high - low);
+    auto zero = scalar_tensor(scope, 0.0, pos_range.GetOutputDesc().dataType, pos_range.GetOutputDesc().sizes);
+    auto one = scalar_tensor(scope, 1.0, pos_range.GetOutputDesc().dataType, pos_range.GetOutputDesc().sizes);
+    return 1 - dml::Min(one, dml::Max(zero, y));
+}
+
+static std::tuple<dml::Expression, dml::Expression> rope_yarn(
+    dml::Graph& scope, dml::Expression theta_extrap, float freq_scale, float corr_dims[2], float ext_factor, float mscale) {
+    // Get n-d rotational scaling corrected for extrapolation
+    auto theta_interp = freq_scale * theta_extrap;
+    auto theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        auto pos_range = sequence_tensor(scope, 0, 2, DML_TENSOR_DATA_TYPE_FLOAT32, theta_extrap.GetOutputDesc().sizes);
+        auto ramp_mix = rope_yarn_ramp(scope, corr_dims[0], corr_dims[1], pos_range) * ext_factor;
+        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
+
+        // Get n-d magnitude scaling corrected for interpolation
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+
+    auto cos_theta = dml::Cos(theta) * mscale;
+    auto sin_theta = dml::Sin(theta) * mscale;
+
+    return std::make_tuple(cos_theta, sin_theta);
+}
+
+static std::tuple<dml::Expression, dml::Expression> generate_cos_sin_caches(
+    dml::Graph& scope,
+    dml::Expression position_ids,
+    const dml::TensorDesc& input_desc,
+    float freq_scale,
+    float corr_dims[2],
+    float ext_factor,
+    float mscale,
+    float theta_scale
+) {
+    dml::TensorDimensions pos_range_sizes(input_desc.sizes.size(), 1);
+    pos_range_sizes.back() = input_desc.sizes.back() / 2;
+
+    auto dml_theta_scale = scalar_tensor(scope, theta_scale, DML_TENSOR_DATA_TYPE_FLOAT32, pos_range_sizes);
+    auto exp_range = sequence_tensor(scope, 0, 1, DML_TENSOR_DATA_TYPE_FLOAT32, pos_range_sizes);
+    auto exp = dml::Pow(dml_theta_scale, exp_range);
+    position_ids = dml::Cast(position_ids, exp.GetOutputDesc().dataType);
+    auto theta = dml::Gemm(position_ids, exp, NullOpt, DML_MATRIX_TRANSFORM_TRANSPOSE, DML_MATRIX_TRANSFORM_NONE);
+
+    dml::Expression cos_cache;
+    dml::Expression sin_cache;
+    std::tie(cos_cache, sin_cache) = rope_yarn(scope, theta, freq_scale, corr_dims, ext_factor, mscale);
+
+    // TODO (pavignol): Check if we still get good results by doing the above calculations in float16 only
+    if (cos_cache.GetOutputDesc().dataType != input_desc.dataType) {
+        cos_cache = dml::Cast(cos_cache, input_desc.dataType);
+        sin_cache = dml::Cast(sin_cache, input_desc.dataType);
+    }
+
+    return std::make_tuple(cos_cache, sin_cache);
+}
+
+static dml::Expression create_rope(
+    dml::Graph& scope,
+    const std::vector<dml::Expression>& node_inputs,
+    const dml::TensorDesc& output_tensor_desc,
+    int mode,
+    int n_dims,
+    float freq_base,
+    float freq_scale,
+    float n_orig_ctx,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow,
+    float xpos_base,
+    bool xpos_down
+) {
+    // TODO (pavignol): Support all float parameters
+    GGML_ASSERT(node_inputs.size() == 2);
+    GGML_ASSERT(mode == 0);
+    GGML_ASSERT(xpos_base == 0.0f);
+
+    float corr_dims[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_orig_ctx, freq_base, beta_fast, beta_slow, corr_dims);
+
+    auto input = node_inputs[0];
+    auto position_ids = node_inputs[1];
+    uint32_t batch_size = input.GetOutputDesc().sizes[0];
+    uint32_t seq_len = input.GetOutputDesc().sizes[1];
+    uint32_t num_heads = input.GetOutputDesc().sizes[2];
+    uint32_t head_dim = input.GetOutputDesc().sizes[3];
+
+    const float theta_scale = powf(freq_base, -2.0f / n_dims);
+    dml::Expression gathered_cos;
+    dml::Expression gathered_sin;
+    std::tie(gathered_cos, gathered_sin) = generate_cos_sin_caches(scope, position_ids, input.GetOutputDesc(), freq_scale, corr_dims, ext_factor, attn_factor, theta_scale);
+
+    auto reshaped_input = dml::Reinterpret(input, dml::TensorDimensions({batch_size, seq_len, num_heads, head_dim / 2, 2}), NullOpt);
+
+    std::array<uint32_t, 2> split_sizes = {1, 1};
+    auto split_input_data = dml::Split(reshaped_input, 4, split_sizes);
+    std::swap(split_input_data[0], split_input_data[1]);
+    auto rotated_input = dml::Join(split_input_data, 4);
+
+    dml::TensorStrides broadcasted_cos_sin_strides({seq_len * head_dim / 2, head_dim / 2, 0, 1, 0});
+    gathered_cos = dml::Reinterpret(gathered_cos, reshaped_input.GetOutputDesc().sizes, broadcasted_cos_sin_strides);
+    gathered_sin = dml::Reinterpret(gathered_sin, reshaped_input.GetOutputDesc().sizes, broadcasted_cos_sin_strides);
+
+    auto sign_range = sequence_tensor(scope, -1.0, 2.0, input.GetOutputDesc().dataType, dml::TensorDimensions({2}));
+    sign_range = dml::Reinterpret(sign_range, reshaped_input.GetOutputDesc().sizes, dml::TensorStrides({0, 0, 0, 0, 1}));
+
+    auto non_rotated_cos = reshaped_input * gathered_cos;
+    auto rotated_sin = rotated_input * gathered_sin * sign_range;
+    auto result = non_rotated_cos + rotated_sin;
+    result = dml::Reinterpret(result, output_tensor_desc.sizes, output_tensor_desc.strides);
+    return result;
+}
+
+/*
 static std::tuple<dml::Expression, dml::Expression> generate_cos_sin_caches(
     dml::Graph& scope,
     const dml::TensorDesc& input_desc,
@@ -613,8 +876,10 @@ static dml::Expression create_rope(
     dml::Graph& scope,
     const std::vector<dml::Expression>& node_inputs,
     const dml::TensorDesc& output_tensor_desc,
+    int mode,
+    int n_dims,
     float freq_base,
-    float max_pos_embeddings,
+    float n_orig_ctx,
     float freq_scale,
     float ext_factor,
     float attn_factor,
@@ -623,6 +888,10 @@ static dml::Expression create_rope(
 ) {
     // TODO (pavignol): Support all float parameters
     GGML_ASSERT(node_inputs.size() == 2);
+    GGML_ASSERT(mode == 0);
+
+    float corr_dims[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_orig_ctx, freq_base, beta_fast, beta_slow, corr_dims);
 
     auto input = node_inputs[0];
     auto position_ids = node_inputs[1];
@@ -633,7 +902,7 @@ static dml::Expression create_rope(
 
     dml::Expression cos_cache;
     dml::Expression sin_cache;
-    std::tie(cos_cache, sin_cache) = generate_cos_sin_caches(scope, input.GetOutputDesc(), head_dim, freq_base, max_pos_embeddings);
+    std::tie(cos_cache, sin_cache) = generate_cos_sin_caches(scope, input.GetOutputDesc(), head_dim, freq_base, n_orig_ctx);
 
     auto reshaped_input = dml::Reinterpret(input, dml::TensorDimensions({batch_size, seq_len, num_heads, 2, head_dim / 2}), NullOpt);
 
@@ -670,6 +939,7 @@ static dml::Expression create_rope(
     result = dml::Reinterpret(result, output_tensor_desc.sizes, output_tensor_desc.strides);
     return result;
 }
+*/
 
 static struct GraphInput {
     GraphInput(dml::Expression dml_tensor, void* raw_data, uint32_t index) : dml_tensor(dml_tensor), raw_data(raw_data), index(index) {}
@@ -721,7 +991,10 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                 {
                     const int n_dims     = ((int32_t *) node->op_params)[1];
                     const int mode       = ((int32_t *) node->op_params)[2];
-                    const int max_pos_embeddings = ((int32_t *) node->op_params)[4];
+                    const int n_orig_ctx = ((int32_t *) node->op_params)[4];
+
+                    float xpos_base;
+                    bool  xpos_down;
 
                     float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
                     memcpy(&freq_base,   (int32_t *) node->op_params +  5, sizeof(float));
@@ -730,7 +1003,9 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     memcpy(&attn_factor, (int32_t *) node->op_params +  8, sizeof(float));
                     memcpy(&beta_fast,   (int32_t *) node->op_params +  9, sizeof(float));
                     memcpy(&beta_slow,   (int32_t *) node->op_params + 10, sizeof(float));
-                    result = create_rope(scope, node_inputs, dml_output_desc, freq_base, max_pos_embeddings, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+                    memcpy(&xpos_base,   (int32_t *) node->op_params + 11, sizeof(float));
+                    memcpy(&xpos_down,   (int32_t *) node->op_params + 12, sizeof(bool));
+                    result = create_rope(scope, node_inputs, dml_output_desc, mode, n_dims, freq_base, freq_scale, n_orig_ctx, ext_factor, attn_factor, beta_fast, beta_slow, xpos_base, xpos_down);
                 }
                 break;
             case GGML_OP_CPY:
@@ -741,23 +1016,49 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                 {
                     float scale;
                     memcpy(&scale, node->op_params, sizeof(float));
-                    result = create_softmax(scope, node_inputs, dml_output_desc, scale);
+                    float max_bias;
+                    memcpy(&max_bias, (float *) node->op_params + 1, sizeof(float));
+                    result = create_softmax(scope, node_inputs, dml_output_desc, scale, max_bias);
                 }
                 break;
             case GGML_OP_ADD:
                 result = create_add(scope, node_inputs, dml_output_desc);
                 break;
-
             case GGML_OP_UNARY:
                 switch (ggml_get_unary_op(node)) {
                 case GGML_UNARY_OP_RELU:
                     result = create_relu(scope, node_inputs, dml_output_desc);
                     break;
+                case GGML_UNARY_OP_GELU_QUICK:
                 case GGML_UNARY_OP_GELU:
                     result = create_gelu(scope, node_inputs, dml_output_desc);
                     break;
                 case GGML_UNARY_OP_SILU:
                     result = create_silu(scope, node_inputs, dml_output_desc);
+                    break;
+                case GGML_UNARY_OP_ABS:
+                    result = create_abs(scope, node_inputs, dml_output_desc);
+                    break;
+                case GGML_UNARY_OP_NEG:
+                    result = create_neg(scope, node_inputs, dml_output_desc);
+                    break;
+                case GGML_UNARY_OP_TANH:
+                    result = create_tanh(scope, node_inputs, dml_output_desc);
+                    break;
+                case GGML_UNARY_OP_ELU:
+                    result = create_elu(scope, node_inputs, dml_output_desc);
+                    break;
+                case GGML_UNARY_OP_HARDSIGMOID:
+                    result = create_hardsigmoid(scope, node_inputs, dml_output_desc);
+                    break;
+                case GGML_UNARY_OP_SGN:
+                    result = create_signum(scope, node_inputs, dml_output_desc);
+                    break;
+                case GGML_UNARY_OP_STEP:
+                    result = create_step(scope, node_inputs, dml_output_desc);
+                    break;
+                case GGML_UNARY_OP_HARDSWISH:
+                    result = create_hardswish(scope, node_inputs, dml_output_desc);
                     break;
                 default:
                     THROW_HR(E_NOTIMPL);
@@ -767,6 +1068,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
             case GGML_OP_PERMUTE:
             case GGML_OP_RESHAPE:
             case GGML_OP_VIEW:
+            case GGML_OP_NONE:
                 // Nothing to do here yet, but we may have to implement it if we move to a graph
                 break;
             default:
@@ -859,16 +1161,84 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         s_directml_context->execution_context->ExecuteOperator(compiled_op.Get(), persistentResourceBindingDesc, inputBindings, outputBindings);
     }
 
-    ComPtr<ID3D12Fence> fence;
-    uint64_t completion_value;
-    s_directml_context->execution_context->ExecuteCommandList(nullptr, fence.GetAddressOf(), &completion_value);
+    if (!dml_operators.empty()) {
+        ComPtr<ID3D12Fence> fence;
+        uint64_t completion_value;
+        s_directml_context->execution_context->ExecuteCommandList(nullptr, fence.GetAddressOf(), &completion_value);
+    }
 
     return true;
 }
 
 static bool ggml_directml_supports_op(const struct ggml_tensor * op) {
-    // TODO (pavignol): Implement me (look at ggml_vk_supports_op to see how to parse ops)
-    return true;
+    switch (op->type) {
+    case GGML_TYPE_F16:
+    case GGML_TYPE_F32:
+    case GGML_TYPE_I32:
+        break;
+    default:
+        return false;
+    }
+
+    switch (op->op) {
+    case GGML_OP_ADD:
+    case GGML_OP_MUL:
+        // We only support broadcasting when the dimension to broadcast is 1
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            if (op->src[0]->ne[i] != op->src[1]->ne[i] && op->src[0]->ne[i] != 1 && op->src[1]->ne[i] != 1) {
+                return false;
+            }
+        }
+        return true;
+    case GGML_OP_MUL_MAT:
+        // We only support broadcasting when the dimension to broadcast is 1
+        for (int i = GGML_MAX_DIMS - 2; i < GGML_MAX_DIMS; ++i) {
+            if (op->src[0]->ne[i] != op->src[1]->ne[i] && op->src[0]->ne[i] != 1 && op->src[1]->ne[i] != 1) {
+                return false;
+            }
+        }
+        return true;
+    case GGML_OP_SOFT_MAX:
+        {
+            float max_bias;
+            memcpy(&max_bias, (float *) op->op_params + 1, sizeof(float));
+            return max_bias == 0.0f;
+        }
+    case GGML_OP_ROPE:
+        {
+            const int mode = ((int32_t *) op->op_params)[2];
+            return mode == 0;
+        }
+    case GGML_OP_UNARY:
+        switch (ggml_get_unary_op(op)) {
+        case GGML_UNARY_OP_RELU:
+        case GGML_UNARY_OP_GELU_QUICK:
+        case GGML_UNARY_OP_GELU:
+        case GGML_UNARY_OP_SILU:
+        case GGML_UNARY_OP_ABS:
+        case GGML_UNARY_OP_NEG:
+        case GGML_UNARY_OP_TANH:
+        case GGML_UNARY_OP_ELU:
+        case GGML_UNARY_OP_HARDSIGMOID:
+        case GGML_UNARY_OP_SGN:
+        case GGML_UNARY_OP_STEP:
+        case GGML_UNARY_OP_HARDSWISH:
+            return true;
+        default:
+            return false;
+        }
+    case GGML_OP_RMS_NORM:
+    case GGML_OP_CPY:
+    case GGML_OP_CONT:
+    case GGML_OP_TRANSPOSE:
+    case GGML_OP_PERMUTE:
+    case GGML_OP_RESHAPE:
+    case GGML_OP_VIEW:
+    case GGML_OP_NONE:
+        return true;
+    default:
+        return false;
+    }
 }
 
 static bool ggml_backend_directml_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {

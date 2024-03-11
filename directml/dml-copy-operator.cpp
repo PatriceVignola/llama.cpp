@@ -37,11 +37,11 @@ static size_t get_data_type_size(DML_TENSOR_DATA_TYPE dml_datatype) {
 
 DmlCopyOperator::DmlCopyOperator(
     ID3D12Device* d3d12Device,
-    std::shared_ptr<Dml::ExecutionContext> executionContext,
+    Dml::ExecutionContext* executionContext,
     const dml::TensorDesc& input_tensor_desc,
     const dml::TensorDesc& output_tensor_desc)
         : m_device(d3d12Device)
-        , m_executionContext(std::move(executionContext))
+        , m_executionContext(executionContext)
 {
     std::copy_n(input_tensor_desc.sizes.begin(), input_tensor_desc.sizes.size(), m_constants.inputSizes);
     std::copy_n(output_tensor_desc.sizes.begin(), output_tensor_desc.sizes.size(), m_constants.outputSizes);

@@ -269,7 +269,7 @@ struct ggml_directml_context {
     Dml::DmlCommandRecorder* current_recorder = nullptr;
 
     // TODO (pavignol): Convert to an hash map
-    std::vector<std::pair<NodeKey, std::shared_ptr<DmlOperator>>> operator_cache;
+    std::vector<std::pair<NodeKey, std::unique_ptr<DmlOperator>>> operator_cache;
 
     ggml_directml_context(int device)
         : device(device)
@@ -603,7 +603,7 @@ static std::unique_ptr<DmlCopyOperator> create_copy(dml::Graph& scope, const std
 
     return std::make_unique<DmlCopyOperator>(
         s_directml_context->d3d12_device.Get(),
-        s_directml_context->execution_context,
+        s_directml_context->execution_context.get(),
         node_inputs[0].GetOutputDesc(),
         output_tensor_desc);
 }
@@ -1026,14 +1026,14 @@ static float fp16_to_fp32(ggml_fp16_t value) {
     return static_cast<float>(GGML_COMPUTE_FP16_TO_FP32(value));
 }
 
-static std::shared_ptr<DmlOperator> find_operator(const NodeKey& new_node_key) {
+static DmlOperator* find_operator(const NodeKey& new_node_key) {
     for (const auto& old_op : s_directml_context->operator_cache) {
         if (new_node_key == old_op.first) {
-            return old_op.second;
+            return old_op.second.get();
         }
     }
 
-    return {};
+    return nullptr;
 }
 
 static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -1042,7 +1042,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
     std::unordered_map<ggml_tensor*, dml::Expression> nodes;
     std::vector<std::vector<ggml_tensor*>> operator_inputs;
     std::vector<std::vector<ggml_tensor*>> operator_outputs;
-    std::vector<std::shared_ptr<DmlOperator>> dml_operators;
+    std::vector<DmlOperator*> dml_operators;
 
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         auto node = cgraph->nodes[node_index];
@@ -1073,11 +1073,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         float epsilon;
                         memcpy(&epsilon, node->op_params, sizeof(float));
                         auto result = create_rmsnorm(scope, node_inputs, dml_output_desc, epsilon);
-                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
+                        dml_op = cache_dml_op.get();
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
                     }
 
-                    dml_operators.push_back(std::move(dml_op));
+                    dml_operators.push_back(dml_op);
                 }
                 break;
             case GGML_OP_MUL_MAT:
@@ -1087,11 +1088,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 
                     if (!dml_op) {
                         auto result = create_matmul(scope, node_inputs, dml_output_desc);
-                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
+                        dml_op = cache_dml_op.get();
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
                     }
 
-                    dml_operators.push_back(std::move(dml_op));
+                    dml_operators.push_back(dml_op);
                 }
                 break;
             case GGML_OP_MUL:
@@ -1101,11 +1103,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 
                     if (!dml_op) {
                         auto result = create_multiply(scope, node_inputs, dml_output_desc);
-                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
+                        dml_op = cache_dml_op.get();
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
                     }
 
-                    dml_operators.push_back(std::move(dml_op));
+                    dml_operators.push_back(dml_op);
                 }
                 break;
             case GGML_OP_ROPE:
@@ -1132,11 +1135,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         memcpy(&xpos_down,   (int32_t *) node->op_params + 12, sizeof(bool));
                         auto result = create_rope(scope, node_inputs, dml_output_desc, mode, n_dims, freq_base, freq_scale, n_orig_ctx, ext_factor, attn_factor, beta_fast, beta_slow, xpos_base, xpos_down);
 
-                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
+                        dml_op = cache_dml_op.get();
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
                     }
 
-                    dml_operators.push_back(std::move(dml_op));
+                    dml_operators.push_back(dml_op);
                 }
                 break;
             case GGML_OP_CPY:
@@ -1146,11 +1150,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     auto dml_op = find_operator(node_key);
 
                     if (!dml_op) {
-                        dml_op = create_copy(scope, node_inputs, dml_output_desc);
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                        auto cache_dml_op = create_copy(scope, node_inputs, dml_output_desc);
+                        dml_op = cache_dml_op.get();
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
                     }
 
-                    dml_operators.push_back(std::move(dml_op));
+                    dml_operators.push_back(dml_op);
                 }
                 break;
             case GGML_OP_SOFT_MAX:
@@ -1164,11 +1169,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         float max_bias;
                         memcpy(&max_bias, (float *) node->op_params + 1, sizeof(float));
                         auto result = create_softmax(scope, node_inputs, dml_output_desc, scale, max_bias);
-                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
+                        dml_op = cache_dml_op.get();
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
                     }
 
-                    dml_operators.push_back(std::move(dml_op));
+                    dml_operators.push_back(dml_op);
                 }
                 break;
             case GGML_OP_ADD:
@@ -1178,11 +1184,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 
                     if (!dml_op) {
                         auto result = create_add(scope, node_inputs, dml_output_desc);
-                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
+                        dml_op = cache_dml_op.get();
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
                     }
 
-                    dml_operators.push_back(std::move(dml_op));
+                    dml_operators.push_back(dml_op);
                 }
                 break;
             case GGML_OP_UNARY:
@@ -1232,11 +1239,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                             THROW_HR(E_NOTIMPL);
                         }
 
-                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
+                        dml_op = cache_dml_op.get();
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
                     }
 
-                    dml_operators.push_back(std::move(dml_op));
+                    dml_operators.push_back(dml_op);
                 }
                 break;
             case GGML_OP_TRANSPOSE:

@@ -15,7 +15,7 @@ class DmlCopyOperator : public DmlOperator
 public:
     DmlCopyOperator(
         ID3D12Device* d3d12Device,
-        std::shared_ptr<Dml::ExecutionContext> executionContext,
+        Dml::ExecutionContext* executionContext,
         const dml::TensorDesc& input_tensor_desc,
         const dml::TensorDesc& output_tensor_desc);
 
@@ -37,5 +37,5 @@ private:
     ComPtr<ID3D12RootSignature> m_rootSignature;
     ComPtr<ID3D12PipelineState> m_pipelineState;
     Constants m_constants;
-    std::shared_ptr<Dml::ExecutionContext> m_executionContext;
+    Dml::ExecutionContext* m_executionContext;
 };

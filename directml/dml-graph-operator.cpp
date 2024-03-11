@@ -6,10 +6,10 @@
 DmlGraphOperator::DmlGraphOperator(
     dml::Graph& scope,
     dml::Expression expression,
-    std::shared_ptr<Dml::ExecutionContext> executionContext,
+    Dml::ExecutionContext* executionContext,
     Dml::DmlGpuAllocator& allocator
 ) {
-    m_executionContext = std::move(executionContext);
+    m_executionContext = executionContext;
     m_compiledOp = scope.Compile(DML_EXECUTION_FLAG_NONE, {expression});
 
     uint64_t persistentResourceSize = m_compiledOp->GetBindingProperties().PersistentResourceSize;

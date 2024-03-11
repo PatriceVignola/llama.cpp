@@ -343,11 +343,13 @@ static const char * ggml_backend_directml_buffer_get_name(ggml_backend_buffer_t 
 }
 
 static void ggml_backend_directml_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    auto * memory = (ggml_directml_memory *)buffer->context;
+
     if (s_directml_context) {
-        auto * memory = (ggml_directml_memory *)buffer->context;
         s_directml_context->allocator->Free(memory->data);
-        delete memory;
     }
+
+    delete memory;
 }
 
 static void * ggml_backend_directml_buffer_get_base(ggml_backend_buffer_t buffer) {

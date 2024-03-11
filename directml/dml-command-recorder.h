@@ -15,6 +15,7 @@
 #include "dml-descriptor-pool.h"
 #include "dml-command-queue.h"
 #include "dml-gpu-allocator.h"
+#include "dml_optional_extensions.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -128,6 +129,7 @@ namespace Dml
         // We should always have 1 less reset thread than command lists since we always need a clean command list, but
         // the other ones can all be in the process of getting reset
         std::array<std::unique_ptr<std::thread>, commandListCount - 1> m_resetThreads;
+        Optional<DmlBuffer> m_temporaryBuffer;
 
         void SetDescriptorHeap(ID3D12DescriptorHeap* descriptorHeap);
     };

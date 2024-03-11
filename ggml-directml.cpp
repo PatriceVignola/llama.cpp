@@ -280,9 +280,11 @@ static const char * ggml_backend_directml_buffer_get_name(ggml_backend_buffer_t 
 }
 
 static void ggml_backend_directml_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    auto * memory = (ggml_directml_memory *)buffer->context;
-    s_directml_context->allocator->Free(memory->data);
-    delete memory;
+    if (s_directml_context) {
+        auto * memory = (ggml_directml_memory *)buffer->context;
+        s_directml_context->allocator->Free(memory->data);
+        delete memory;
+    }
 }
 
 static void * ggml_backend_directml_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -314,11 +316,15 @@ static void ggml_backend_directml_buffer_clear(ggml_backend_buffer_t buffer, uin
     printf("ggml_backend_directml_buffer_clear\n");
 }
 
+static void ggml_backend_directml_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    tensor->backend = GGML_BACKEND_TYPE_GPU;
+}
+
 static ggml_backend_buffer_i ggml_backend_directml_buffer_i = {
     /* .get_name        = */ ggml_backend_directml_buffer_get_name,
     /* .free_buffer     = */ ggml_backend_directml_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_directml_buffer_get_base,
-    /* .init_tensor     = */ NULL,
+    /* .init_tensor     = */ ggml_backend_directml_buffer_init_tensor,
     /* .set_tensor      = */ ggml_backend_directml_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_directml_buffer_get_tensor,
     /* .cpy_tensor      = */ NULL,

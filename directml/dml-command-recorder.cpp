@@ -75,18 +75,21 @@ void DmlCommandRecorder::InitializeOperator(
     {
         auto allocator = m_allocator.lock();
 
-        // Allocate and immediately free a temporary buffer. The buffer resource will still be
-        // alive (managed by the pool); freeing allows the resource to be shared with other operators.
-        auto buffer = allocator->AllocateDefaultBuffer(temporaryResourceSize);
+        if (m_temporaryBuffer && m_temporaryBuffer->SizeInBytes() < temporaryResourceSize) {
+            // The temporary buffer is not big enough, so delete it and create a new one
+            auto managedTemporaryBuffer = wil::MakeOrThrow<Dml::DmlManagedBuffer>(std::move(*m_temporaryBuffer));
+            m_queue->QueueReference(managedTemporaryBuffer.Get(), true);
+            m_temporaryBuffer = {};
+        }
+
+        if (!m_temporaryBuffer) {
+            m_temporaryBuffer = allocator->AllocateDefaultBuffer(temporaryResourceSize);
+        }
 
         // Bind the temporary resource.
-        DML_BUFFER_BINDING bufferBinding = buffer.GetBufferBinding();
+        DML_BUFFER_BINDING bufferBinding = m_temporaryBuffer->GetBufferBinding();
         DML_BINDING_DESC bindingDesc = { DML_BINDING_TYPE_BUFFER, &bufferBinding };
         bindingTable->BindTemporaryResource(&bindingDesc);
-
-        // TODO (pavignol): We shouldn't need to do this if memory was allocated from a bool with real BFC style
-        auto managedPersistentBuffer = wil::MakeOrThrow<Dml::DmlManagedBuffer>(std::move(buffer));
-        m_queue->QueueReference(managedPersistentBuffer.Get(), true);
     }
 
     // Bind inputs, if provided.
@@ -148,18 +151,21 @@ void DmlCommandRecorder::ExecuteGraphOperator(
     {
         auto allocator = m_allocator.lock();
 
-        // Allocate and immediately free a temporary buffer. The buffer resource will still be
-        // alive (managed by the pool); freeing allows the resource to be shared with other operators.
-        auto buffer = allocator->AllocateDefaultBuffer(temporaryResourceSize);
+        if (m_temporaryBuffer && m_temporaryBuffer->SizeInBytes() < temporaryResourceSize) {
+            // The temporary buffer is not big enough, so delete it and create a new one
+            auto managedTemporaryBuffer = wil::MakeOrThrow<Dml::DmlManagedBuffer>(std::move(*m_temporaryBuffer));
+            m_queue->QueueReference(managedTemporaryBuffer.Get(), true);
+            m_temporaryBuffer = {};
+        }
+
+        if (!m_temporaryBuffer) {
+            m_temporaryBuffer = allocator->AllocateDefaultBuffer(temporaryResourceSize);
+        }
 
         // Bind the temporary resource.
-        DML_BUFFER_BINDING bufferBinding = buffer.GetBufferBinding();
+        DML_BUFFER_BINDING bufferBinding = m_temporaryBuffer->GetBufferBinding();
         DML_BINDING_DESC bindingDesc = { DML_BINDING_TYPE_BUFFER, &bufferBinding };
         bindingTable->BindTemporaryResource(&bindingDesc);
-
-        // TODO (pavignol): We shouldn't need to do this if memory was allocated from a bool with real BFC style
-        auto managedPersistentBuffer = wil::MakeOrThrow<Dml::DmlManagedBuffer>(std::move(buffer));
-        m_queue->QueueReference(managedPersistentBuffer.Get(), true);
     }
 
     if (persistentResourceBinding.Type != DML_BINDING_TYPE_NONE)

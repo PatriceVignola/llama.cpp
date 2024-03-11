@@ -163,7 +163,8 @@ static llama_token llama_sampling_sample_impl(
 
     const int n_vocab = llama_n_vocab(llama_get_model(ctx_main));
 
-    const float   temp            = params.temp;
+    // const float   temp            = params.temp;
+    const float   temp            = 0;
     const int32_t penalty_last_n  = params.penalty_last_n < 0 ? params.n_prev : params.penalty_last_n;
     const float   penalty_repeat  = params.penalty_repeat;
     const float   penalty_freq    = params.penalty_freq;

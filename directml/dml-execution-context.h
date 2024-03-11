@@ -49,11 +49,20 @@ namespace Dml
             const DML_BINDING_DESC& persistentResourceBinding,
             const DML_BINDING_DESC& inputArrayBinding);
 
-        void ExecuteOperator(
+        void ExecuteGraphOperator(
             IDMLCompiledOperator* op,
             const DML_BINDING_DESC& persistentResourceBinding,
             const std::vector<DML_BINDING_DESC>& inputBindings,
             const std::vector<DML_BINDING_DESC>& outputBindings);
+
+        void ExecuteCustomOperator(
+            ID3D12RootSignature* root_signature,
+            ID3D12PipelineState* pipeline_state,
+            const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
+            const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
+            const void* constants,
+            uint32_t total_element_count,
+            uint32_t constant_count);
 
         void ExecuteCommandList(
             ID3D12GraphicsCommandList* commandList,

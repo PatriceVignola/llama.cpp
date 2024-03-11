@@ -30,6 +30,9 @@
 #include "directml/dml-reserved-resource-sub-allocator.h"
 #include "directml/dml-readback-heap.h"
 #include "directml/dml-managed-buffer.h"
+#include "directml/dml-copy-operator.h"
+#include "directml/dml-operator.h"
+#include "directml/dml-graph-operator.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -291,7 +294,7 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
     ID3D12Resource* dstData = bufferRegion.GetD3D12Resource();
 
     const auto dstState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; // GPU resources are always kept in UAV state
-    s_directml_context->upload_heap.BeginUploadToGpu(dstData, bufferRegion.Offset(), dstState, reinterpret_cast<const uint8_t*>(srcData), size);
+    s_directml_context->upload_heap.BeginUploadToGpu(dstData, bufferRegion.Offset() + offset, dstState, reinterpret_cast<const uint8_t*>(srcData), size);
 
     // TODO (pavignol): Optimize by not flushing as often
     s_directml_context->execution_context->Flush();
@@ -303,7 +306,7 @@ static void ggml_backend_directml_buffer_get_tensor(ggml_backend_buffer_t buffer
 
     const auto srcState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; // GPU resources are always kept in UAV state
     // Performs a blocking call to synchronize and read back data from the GPU into the destination buffer
-    s_directml_context->readback_heap.ReadbackFromGpu(s_directml_context->execution_context.get(), reinterpret_cast<uint8_t*>(dstData), size, srcData, bufferRegion.Offset(), srcState);
+    s_directml_context->readback_heap.ReadbackFromGpu(s_directml_context->execution_context.get(), reinterpret_cast<uint8_t*>(dstData), size, srcData, bufferRegion.Offset() + offset, srcState);
 }
 
 static void ggml_backend_directml_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -524,14 +527,14 @@ static dml::Expression create_multiply(dml::Graph& scope, const std::vector<dml:
     return result;
 }
 
-static dml::Expression create_copy(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
+static std::unique_ptr<DmlCopyOperator> create_copy(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
     GGML_ASSERT(node_inputs.size() == 1 || node_inputs.size() == 2);
 
-    auto output = node_inputs[0].GetOutputDesc().dataType == output_tensor_desc.dataType
-        ? dml::Identity(node_inputs[0])
-        : dml::Cast(node_inputs[0], output_tensor_desc.dataType);
-
-    return output;
+    return std::make_unique<DmlCopyOperator>(
+        s_directml_context->d3d12_device.Get(),
+        s_directml_context->execution_context,
+        node_inputs[0].GetOutputDesc(),
+        output_tensor_desc);
 }
 
 static dml::Expression create_add(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc) {
@@ -948,44 +951,57 @@ static struct GraphInput {
     const uint32_t index;
 };
 
+static float fp16_to_fp32(ggml_fp16_t value) {
+    return static_cast<float>(GGML_COMPUTE_FP16_TO_FP32(value));
+}
+
 static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = static_cast<ggml_directml_context *>(backend->context);
 
     std::unordered_map<ggml_tensor*, dml::Expression> nodes;
-    std::vector<dml::Expression> dml_operators;
     std::vector<std::vector<ggml_tensor*>> operator_inputs;
     std::vector<std::vector<ggml_tensor*>> operator_outputs;
-    std::vector<dml::Graph> dml_graphs;
+    std::vector<std::unique_ptr<DmlOperator>> dml_operators;
 
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
-        auto scope = dml::Graph(s_directml_context->dml_device.Get());
         auto node = cgraph->nodes[node_index];
+        auto scope = dml::Graph(s_directml_context->dml_device.Get());
 
+        std::vector<dml::TensorDesc> input_tensors;
         std::vector<dml::Expression> node_inputs;
         for (int src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
             if (!node->src[src_index] || (node->op == GGML_OP_CPY && src_index == 1)) {
                 break;
             }
 
-            node_inputs.push_back(dml::InputTensor(scope, src_index, ggml_to_dml_tensor_desc(node->src[src_index])));
+            input_tensors.push_back(ggml_to_dml_tensor_desc(node->src[src_index]));
+            node_inputs.push_back(dml::InputTensor(scope, src_index, input_tensors[src_index]));
         }
 
-        dml::Expression result;
         auto dml_output_desc = ggml_to_dml_tensor_desc(node);
+        bool is_no_op = false;
+        scope.PushName(node->name);
 
         switch (node->op) {
             case GGML_OP_RMS_NORM:
                 {
                     float epsilon;
                     memcpy(&epsilon, node->op_params, sizeof(float));
-                    result = create_rmsnorm(scope, node_inputs, dml_output_desc, epsilon);
+                    auto result = create_rmsnorm(scope, node_inputs, dml_output_desc, epsilon);
+                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
                 }
                 break;
             case GGML_OP_MUL_MAT:
-                result = create_matmul(scope, node_inputs, dml_output_desc);
+                {
+                    auto result = create_matmul(scope, node_inputs, dml_output_desc);
+                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
+                }
                 break;
             case GGML_OP_MUL:
-                result = create_multiply(scope, node_inputs, dml_output_desc);
+                {
+                    auto result = create_multiply(scope, node_inputs, dml_output_desc);
+                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
+                }
                 break;
             case GGML_OP_ROPE:
                 {
@@ -1005,12 +1021,16 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     memcpy(&beta_slow,   (int32_t *) node->op_params + 10, sizeof(float));
                     memcpy(&xpos_base,   (int32_t *) node->op_params + 11, sizeof(float));
                     memcpy(&xpos_down,   (int32_t *) node->op_params + 12, sizeof(bool));
-                    result = create_rope(scope, node_inputs, dml_output_desc, mode, n_dims, freq_base, freq_scale, n_orig_ctx, ext_factor, attn_factor, beta_fast, beta_slow, xpos_base, xpos_down);
+                    auto result = create_rope(scope, node_inputs, dml_output_desc, mode, n_dims, freq_base, freq_scale, n_orig_ctx, ext_factor, attn_factor, beta_fast, beta_slow, xpos_base, xpos_down);
+                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
                 }
                 break;
             case GGML_OP_CPY:
             case GGML_OP_CONT:
-                result = create_copy(scope, node_inputs, dml_output_desc);
+                {
+                    auto result = create_copy(scope, node_inputs, dml_output_desc);
+                    dml_operators.push_back(std::move(result));
+                }
                 break;
             case GGML_OP_SOFT_MAX:
                 {
@@ -1018,50 +1038,60 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     memcpy(&scale, node->op_params, sizeof(float));
                     float max_bias;
                     memcpy(&max_bias, (float *) node->op_params + 1, sizeof(float));
-                    result = create_softmax(scope, node_inputs, dml_output_desc, scale, max_bias);
+                    auto result = create_softmax(scope, node_inputs, dml_output_desc, scale, max_bias);
+                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
                 }
                 break;
             case GGML_OP_ADD:
-                result = create_add(scope, node_inputs, dml_output_desc);
+                {
+                    auto result = create_add(scope, node_inputs, dml_output_desc);
+                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
+                }
                 break;
             case GGML_OP_UNARY:
-                switch (ggml_get_unary_op(node)) {
-                case GGML_UNARY_OP_RELU:
-                    result = create_relu(scope, node_inputs, dml_output_desc);
-                    break;
-                case GGML_UNARY_OP_GELU_QUICK:
-                case GGML_UNARY_OP_GELU:
-                    result = create_gelu(scope, node_inputs, dml_output_desc);
-                    break;
-                case GGML_UNARY_OP_SILU:
-                    result = create_silu(scope, node_inputs, dml_output_desc);
-                    break;
-                case GGML_UNARY_OP_ABS:
-                    result = create_abs(scope, node_inputs, dml_output_desc);
-                    break;
-                case GGML_UNARY_OP_NEG:
-                    result = create_neg(scope, node_inputs, dml_output_desc);
-                    break;
-                case GGML_UNARY_OP_TANH:
-                    result = create_tanh(scope, node_inputs, dml_output_desc);
-                    break;
-                case GGML_UNARY_OP_ELU:
-                    result = create_elu(scope, node_inputs, dml_output_desc);
-                    break;
-                case GGML_UNARY_OP_HARDSIGMOID:
-                    result = create_hardsigmoid(scope, node_inputs, dml_output_desc);
-                    break;
-                case GGML_UNARY_OP_SGN:
-                    result = create_signum(scope, node_inputs, dml_output_desc);
-                    break;
-                case GGML_UNARY_OP_STEP:
-                    result = create_step(scope, node_inputs, dml_output_desc);
-                    break;
-                case GGML_UNARY_OP_HARDSWISH:
-                    result = create_hardswish(scope, node_inputs, dml_output_desc);
-                    break;
-                default:
-                    THROW_HR(E_NOTIMPL);
+                {
+                    dml::Expression result;
+
+                    switch (ggml_get_unary_op(node)) {
+                    case GGML_UNARY_OP_RELU:
+                        result = create_relu(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_GELU_QUICK:
+                    case GGML_UNARY_OP_GELU:
+                        result = create_gelu(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_SILU:
+                        result = create_silu(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_ABS:
+                        result = create_abs(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_NEG:
+                        result = create_neg(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_TANH:
+                        result = create_tanh(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_ELU:
+                        result = create_elu(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_HARDSIGMOID:
+                        result = create_hardsigmoid(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_SGN:
+                        result = create_signum(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_STEP:
+                        result = create_step(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_HARDSWISH:
+                        result = create_hardswish(scope, node_inputs, dml_output_desc);
+                        break;
+                    default:
+                        THROW_HR(E_NOTIMPL);
+                    }
+
+                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
                 }
                 break;
             case GGML_OP_TRANSPOSE:
@@ -1070,15 +1100,15 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
             case GGML_OP_VIEW:
             case GGML_OP_NONE:
                 // Nothing to do here yet, but we may have to implement it if we move to a graph
+                is_no_op = true;
                 break;
             default:
                 THROW_HR(E_NOTIMPL);
         }
 
-        if (result) {
-            dml_graphs.push_back(std::move(scope));
-            dml_operators.push_back(result);
+        scope.PopName();
 
+        if (!is_no_op) {
             std::vector<ggml_tensor*> current_inputs;
             for (int src_index = 0; src_index < node_inputs.size(); ++src_index) {
                 current_inputs.push_back(node->src[src_index]);
@@ -1093,44 +1123,6 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         const std::vector<ggml_tensor*> current_operator_inputs = operator_inputs[operator_index];
         const std::vector<ggml_tensor*> current_operator_outputs = operator_outputs[operator_index];
 
-        Microsoft::WRL::ComPtr<IDMLCompiledOperator> compiled_op = dml_graphs[operator_index].Compile(DML_EXECUTION_FLAG_NONE, {dml_operators[operator_index]});
-        DML_BUFFER_BINDING persistentResourceBinding;
-        ComPtr<Dml::DmlManagedBuffer> managedPersistentBuffer;
-        DML_BINDING_DESC persistentResourceBindingDesc{};
-
-        uint64_t persistentResourceSize = compiled_op->GetBindingProperties().PersistentResourceSize;
-        if (persistentResourceSize > 0)
-        {
-            auto buffer = s_directml_context->allocator->AllocateDefaultBuffer(persistentResourceSize, Dml::AllocatorRoundingMode::Disabled);
-            ComPtr<ID3D12Resource> persistentResource;
-            persistentResource = buffer.GetD3D12Resource();
-            persistentResourceBinding = buffer.GetBufferBinding();
-            managedPersistentBuffer = wil::MakeOrThrow<Dml::DmlManagedBuffer>(std::move(buffer));
-            persistentResourceBindingDesc = DML_BINDING_DESC{ DML_BINDING_TYPE_BUFFER, &persistentResourceBinding };
-            s_directml_context->execution_context->QueueReference(managedPersistentBuffer.Get());
-            s_directml_context->execution_context->QueueReference(persistentResource.Get());
-        }
-
-        DML_BINDING_DESC initInputBindings{};
-
-        s_directml_context->execution_context->InitializeOperator(
-            compiled_op.Get(),
-            persistentResourceBindingDesc,
-            initInputBindings);
-
-        // Queue references to objects which must be kept alive until resulting GPU work completes
-        s_directml_context->execution_context->QueueReference(compiled_op.Get());
-
-        auto FillBindingsFromBuffers = [](auto& bufferBindings, auto& bindingDescs, std::vector<Dml::D3D12BufferRegion>& bufferRegions)
-        {
-            for (auto& bufferRegion : bufferRegions)
-            {
-                bufferBindings.push_back(bufferRegion.GetBufferBinding());
-                bindingDescs.push_back({ DML_BINDING_TYPE_BUFFER, &bufferBindings.back() });
-            }
-        };
-
-        // Bind the inputs
         std::vector<Dml::D3D12BufferRegion> inputBufferRegions;
         inputBufferRegions.reserve(current_operator_inputs.size());
         for (const auto& operator_input : current_operator_inputs) {
@@ -1138,27 +1130,51 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
             inputBufferRegions.push_back(std::move(input_buffer_region));
         }
 
-        std::vector<DML_BUFFER_BINDING> inputBufferBindings;
-        inputBufferBindings.reserve(current_operator_inputs.size());
-        std::vector<DML_BINDING_DESC> inputBindings;
-        inputBindings.reserve(current_operator_inputs.size());
-        FillBindingsFromBuffers(inputBufferBindings, inputBindings, inputBufferRegions);
-
-        // Bins the outputs
         std::vector<Dml::D3D12BufferRegion> outputBufferRegions;
         outputBufferRegions.reserve(current_operator_outputs.size());
         for (const auto& operator_output : current_operator_outputs) {
-            auto output_buffer_region = s_directml_context->allocator->CreateBufferRegion(operator_output->data, operator_output->nb[GGML_MAX_DIMS - 1]);
+            auto output_buffer_region = s_directml_context->allocator->CreateBufferRegion(operator_output->data, ggml_to_dml_tensor_desc(operator_output).totalTensorSizeInBytes);
             outputBufferRegions.push_back(std::move(output_buffer_region));
         }
 
-        std::vector<DML_BUFFER_BINDING> outputBufferBindings;
-        outputBufferBindings.reserve(current_operator_outputs.size());
-        std::vector<DML_BINDING_DESC> outputBindings;
-        outputBindings.reserve(current_operator_outputs.size());
-        FillBindingsFromBuffers(outputBufferBindings, outputBindings, outputBufferRegions);
+        dml_operators[operator_index]->Execute(inputBufferRegions, outputBufferRegions);
 
-        s_directml_context->execution_context->ExecuteOperator(compiled_op.Get(), persistentResourceBindingDesc, inputBindings, outputBindings);
+/*
+        std::vector<std::vector<uint8_t>> srcData(current_operator_inputs.size());
+        for (int i = 0; i < current_operator_inputs.size(); ++i) {
+            srcData[i] = std::vector<uint8_t>(ggml_to_dml_tensor_desc(current_operator_inputs[i]).totalTensorSizeInBytes);
+
+            auto bufferRegion = s_directml_context->allocator->CreateBufferRegion(current_operator_inputs[i]->data, ggml_to_dml_tensor_desc(current_operator_inputs[i]).totalTensorSizeInBytes);
+            ID3D12Resource* srcResource = bufferRegion.GetD3D12Resource();
+
+            const auto srcState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; // GPU resources are always kept in UAV state
+            // Performs a blocking call to synchronize and read back data from the GPU into the destination buffer
+            s_directml_context->readback_heap.ReadbackFromGpu(s_directml_context->execution_context.get(), reinterpret_cast<uint8_t*>(srcData[i].data()), srcData[i].size(), srcResource, bufferRegion.Offset(), srcState);
+        }
+
+        {
+            auto bufferRegion = s_directml_context->allocator->CreateBufferRegion(current_operator_outputs[0]->data, ggml_to_dml_tensor_desc(current_operator_outputs[0]).totalTensorSizeInBytes);
+            ID3D12Resource* srcResource = bufferRegion.GetD3D12Resource();
+            std::vector<uint8_t> dstData(ggml_to_dml_tensor_desc(current_operator_outputs[0]).totalTensorSizeInBytes);
+
+            const auto srcState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; // GPU resources are always kept in UAV state
+            // Performs a blocking call to synchronize and read back data from the GPU into the destination buffer
+            s_directml_context->readback_heap.ReadbackFromGpu(s_directml_context->execution_context.get(), reinterpret_cast<uint8_t*>(dstData.data()), dstData.size(), srcResource, bufferRegion.Offset(), srcState);
+            // printf("Downloaded!\n");
+            // printf("%f\n", fp16_to_fp32(0));
+        }
+
+        if (operator_index == dml_operators.size() - 1) {
+            auto bufferRegion = s_directml_context->allocator->CreateBufferRegion(current_operator_outputs[0]->data, ggml_to_dml_tensor_desc(current_operator_outputs[0]).totalTensorSizeInBytes);
+            ID3D12Resource* srcResource = bufferRegion.GetD3D12Resource();
+            std::vector<uint8_t> dstData(ggml_to_dml_tensor_desc(current_operator_outputs[0]).totalTensorSizeInBytes);
+
+            const auto srcState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; // GPU resources are always kept in UAV state
+            // Performs a blocking call to synchronize and read back data from the GPU into the destination buffer
+            s_directml_context->readback_heap.ReadbackFromGpu(s_directml_context->execution_context.get(), reinterpret_cast<uint8_t*>(dstData.data()), dstData.size(), srcResource, bufferRegion.Offset(), srcState);
+            // printf("Downloaded!\n");
+        }
+*/
     }
 
     if (!dml_operators.empty()) {

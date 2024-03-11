@@ -744,11 +744,13 @@ if (LLAMA_DIRECTML)
     set(PACKAGES_CONFIG ${PROJECT_SOURCE_DIR}/directml/packages.config)
     get_filename_component(PACKAGES_DIR ${CMAKE_CURRENT_BINARY_DIR}/packages ABSOLUTE)
     set(DML_PACKAGE_DIR ${PACKAGES_DIR}/Microsoft.AI.DirectML.1.13.1)
+    set(DXC_PACKAGE_DIR ${PACKAGES_DIR}/Microsoft.Direct3D.DXC.1.7.2308.12)
 
     # Restore nuget packages, which will pull down the DirectML redist package.
     add_custom_command(
         OUTPUT
         ${DML_PACKAGE_DIR}/bin/x64-win/DirectML.lib
+        ${DXC_PACKAGE_DIR}/build/native/bin/x64/dxc.exe
         DEPENDS
         ${PACKAGES_CONFIG}
         ${NUGET_CONFIG}
@@ -805,6 +807,8 @@ if (LLAMA_DIRECTML)
         directml/dml-command-queue.h
         directml/dml-command-recorder.cpp
         directml/dml-command-recorder.h
+        directml/dml-copy-operator.cpp
+        directml/dml-copy-operator.h
         directml/dml-descriptor-pool.cpp
         directml/dml-descriptor-pool.h
         directml/dml-execution-context.cpp
@@ -812,8 +816,11 @@ if (LLAMA_DIRECTML)
         directml/dml-gpu-allocator.cpp
         directml/dml-gpu-allocator.h
         directml/dml-gpu-event.h
+        directml/dml-graph-operator.cpp
+        directml/dml-graph-operator.h
         directml/dml-heap-allocation.h
         directml/dml-managed-buffer.h
+        directml/dml-operator.h
         directml/dml-pooled-upload-heap.cpp
         directml/dml-pooled-upload-heap.h
         directml/dml-readback-heap.cpp

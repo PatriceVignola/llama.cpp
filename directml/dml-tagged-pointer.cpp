@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include <cassert>
+#include "include/DirectML.h"
 #include "dml-tagged-pointer.h"
 
 namespace Dml

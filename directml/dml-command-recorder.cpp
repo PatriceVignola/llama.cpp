@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#define NOMINMAX
+
 #include <assert.h>
 #include <wil/result.h>
 #include <wil/wrl.h>
@@ -117,7 +119,7 @@ void DmlCommandRecorder::InitializeOperator(
     }
 }
 
-void DmlCommandRecorder::ExecuteOperator(
+void DmlCommandRecorder::ExecuteGraphOperator(
     IDMLCompiledOperator* op,
     const DML_BINDING_DESC& persistentResourceBinding,
     const std::vector<DML_BINDING_DESC>& inputBindings,
@@ -179,6 +181,116 @@ void DmlCommandRecorder::ExecuteOperator(
     auto uav = CD3DX12_RESOURCE_BARRIER::UAV(nullptr);
     m_currentCommandList->ResourceBarrier(1, &uav);
     #pragma warning(pop)
+}
+
+inline uint32_t CeilDivide(uint32_t dividend, uint32_t divisor)
+{
+    uint64_t temp = static_cast<uint64_t>(dividend) + divisor - 1;
+    return static_cast<uint32_t>(temp / divisor);
+}
+
+static void GetNextDispatchSize(
+    uint32_t elementCount,
+    uint32_t numThreads,
+    _Out_ uint32_t& dispatch,
+    _Out_ uint32_t& pendingElementCount
+)
+{
+    // Max threads per workgroup is 2^10 (1024). Max dispatch per dimension is 2^16. Taken together, we can dispatch a maximum of
+    // 2^26 (268,435,456) threads along a single dimension. This should suffice for a majority of the workload. Therefore, even
+    // though it is possible to dispatch up to (2^16)^3 workgroups simultaneously, we stick to the simpler 1D dispatch alternative.
+    assert(numThreads <= D3D12_CS_THREAD_GROUP_MAX_THREADS_PER_GROUP);
+
+    const uint32_t maxThreadsPerDispatch = numThreads * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
+
+    // Compute max dispatchable elements
+    const uint32_t availableThreadCount = std::min(elementCount, maxThreadsPerDispatch);
+
+    // Compute required thread group count
+    uint32_t workGroupCount1D = CeilDivide(availableThreadCount, numThreads);
+
+    // Compute min dispatch size
+    dispatch = workGroupCount1D;
+
+    // With the dispatch size computed, compute the dispatched element count
+    const uint32_t dispatchedElementCount = workGroupCount1D * numThreads;
+
+    // Update the pending element count
+    pendingElementCount = (dispatchedElementCount < elementCount) ? elementCount - dispatchedElementCount : 0;
+}
+
+void DmlCommandRecorder::ExecuteCustomOperator(
+    ID3D12RootSignature* root_signature,
+    ID3D12PipelineState* pipeline_state,
+    const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
+    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
+    const void* constants,
+    uint32_t total_element_count,
+    uint32_t constant_count)
+{
+    DescriptorRange descriptorRange = m_descriptorPool.AllocDescriptors(
+        input_buffer_regions.size() + output_buffer_regions.size(),
+        m_queue->GetNextCompletionEvent());
+
+    // Set the root signature and pipeline state
+    m_currentCommandList->SetComputeRootSignature(root_signature);
+    m_currentCommandList->SetPipelineState(pipeline_state);
+
+    uint32_t uav_view_index = 0;
+    for (const auto& input_buffer_region : input_buffer_regions) {
+        m_currentCommandList->SetComputeRootUnorderedAccessView(uav_view_index++, input_buffer_region.GetD3D12Resource()->GetGPUVirtualAddress() + input_buffer_region.Offset());
+    }
+
+    for (const auto& output_buffer_region : output_buffer_regions) {
+        m_currentCommandList->SetComputeRootUnorderedAccessView(uav_view_index++, output_buffer_region.GetD3D12Resource()->GetGPUVirtualAddress() + output_buffer_region.Offset());
+    }
+
+    auto pendingElementCount = total_element_count;
+
+    // Dispatch up to the maximum number of threads per iteration until
+    // all elements are completed
+    while (pendingElementCount > 0)
+    {
+        const uint32_t startIndex = total_element_count - pendingElementCount;
+
+        uint32_t dispatchSizeX;
+
+        GetNextDispatchSize(
+            pendingElementCount,
+            256,
+            dispatchSizeX,
+            pendingElementCount
+        );
+
+        // Set root constants
+        m_currentCommandList->SetComputeRoot32BitConstants(
+            input_buffer_regions.size() + output_buffer_regions.size(), // root parameter index
+            constant_count, // Constant count
+            constants,
+            0 // offset
+        );
+
+        // Set the start index
+        m_currentCommandList->SetComputeRoot32BitConstants(
+            input_buffer_regions.size() + output_buffer_regions.size(), // root parameter index
+            1, // Constant count
+            &startIndex,
+            constant_count - 1 // offset
+        );
+
+        m_currentCommandList->Dispatch(dispatchSizeX, 1, 1);
+    }
+
+    // Record the execution work.
+    SetDescriptorHeap(descriptorRange.heap);
+    m_operationsRecordedInCurrentCommandList = true;
+
+    // Barrier all outputs.
+    std::vector<D3D12_RESOURCE_BARRIER> output_barriers(output_buffer_regions.size());
+    for (int i = 0; i < output_buffer_regions.size(); ++i) {
+        output_barriers[i] = CD3DX12_RESOURCE_BARRIER::UAV(output_buffer_regions[i].GetD3D12Resource());
+    }
+    m_currentCommandList->ResourceBarrier(output_barriers.size(), output_barriers.data());
 }
 
 void DmlCommandRecorder::CopyBufferRegion(

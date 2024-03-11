@@ -193,6 +193,66 @@ static std::shared_ptr<Dml::DmlGpuAllocator> CreateAllocator(
     return allocator;
 }
 
+// TODO (pavignol): Investigate if we can create a graph plan instead
+// A node key uniquely identifies a node/operator based on the sizes, strides, and parameters of their inputs/outputs
+struct NodeKey {
+    ggml_op op;
+    ggml_backend_type backend;
+    ggml_type type;
+    std::array<int64_t, GGML_MAX_DIMS> ne;
+    std::array<int64_t, GGML_MAX_DIMS> nb;
+    int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+
+    std::vector<std::array<int64_t, GGML_MAX_DIMS>> src_ne;
+    std::vector<std::array<int64_t, GGML_MAX_DIMS>> src_nb;
+    std::vector<ggml_type> src_types;
+
+    bool operator==(const NodeKey& other) const {
+        if (backend != other.backend) return false;
+        if (op != other.op) return false;
+        if (type != other.type) return false;
+        if (ne != other.ne) return false;
+        if (nb != other.nb) return false;
+        if (memcmp(op_params, other.op_params, GGML_MAX_OP_PARAMS) != 0) return false;
+        if (src_ne.size() != other.src_ne.size()) return false;
+
+        for (int i = 0; i < src_ne.size(); ++i) {
+            if (src_types[i] != other.src_types[i]) return false;
+            if (src_ne != other.src_ne) return false;
+            if (src_nb != other.src_nb) return false;
+        }
+
+        return true;
+    }
+};
+
+static NodeKey make_node_key(const ggml_tensor* node) {
+    NodeKey node_key;
+    node_key.op = node->op;
+    node_key.backend = node->backend;
+    node_key.type = node->type;
+    std::copy(std::begin(node->ne), std::end(node->ne), node_key.ne.begin());
+    std::copy(std::begin(node->nb), std::end(node->nb), node_key.nb.begin());
+    memcpy(node_key.op_params, node->op_params, GGML_MAX_OP_PARAMS);
+
+    node_key.src_ne.reserve(GGML_MAX_SRC);
+    node_key.src_nb.reserve(GGML_MAX_SRC);
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (!node->src[i]) {
+            break;
+        }
+
+        node_key.src_types.push_back(node->src[i]->type);
+        node_key.src_ne.resize(i + 1);
+        std::copy(std::begin(node->src[i]->ne), std::end(node->src[i]->ne), node_key.src_ne[i].begin());
+        node_key.src_nb.resize(i + 1);
+        std::copy(std::begin(node->src[i]->nb), std::end(node->src[i]->nb), node_key.src_nb[i].begin());
+    }
+
+    return node_key;
+}
+
 struct ggml_directml_context {
     int device;
     ComPtr<ID3D12Device> d3d12_device;
@@ -207,6 +267,9 @@ struct ggml_directml_context {
     std::shared_ptr<Dml::DmlGpuAllocator> allocator;
     Dml::ReadbackHeap readback_heap;
     Dml::DmlCommandRecorder* current_recorder = nullptr;
+
+    // TODO (pavignol): Convert to an hash map
+    std::vector<std::pair<NodeKey, std::shared_ptr<DmlOperator>>> operator_cache;
 
     ggml_directml_context(int device)
         : device(device)
@@ -424,7 +487,7 @@ static size_t get_data_type_size(DML_TENSOR_DATA_TYPE dml_datatype) {
 static dml::TensorDimensions ggml_to_dml_sizes(const ggml_tensor* ggml_tensor) {
     dml::TensorDimensions dml_sizes(GGML_MAX_DIMS);
     for (uint32_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
-        dml_sizes[GGML_MAX_DIMS - dim - 1] = ggml_tensor->ne[dim];
+        dml_sizes[GGML_MAX_DIMS - dim - 1] = static_cast<uint32_t>(ggml_tensor->ne[dim]);
     }
 
     return dml_sizes;
@@ -438,7 +501,7 @@ static dml::TensorStrides ggml_to_dml_strides(const ggml_tensor* ggml_tensor) {
         if (ggml_tensor->ne[dim] == 1) {
             dml_strides[GGML_MAX_DIMS - dim - 1] = 0;
         } else {
-            dml_strides[GGML_MAX_DIMS - dim - 1] = ggml_tensor->nb[dim] / dtype_size;
+            dml_strides[GGML_MAX_DIMS - dim - 1] = static_cast<uint32_t>(ggml_tensor->nb[dim] / dtype_size);
         }
     }
 
@@ -449,7 +512,7 @@ static dml::TensorDesc ggml_to_dml_tensor_desc(const ggml_tensor* ggml_tensor) {
     auto dml_datatype = ggml_to_dml_datatype(ggml_tensor->type);
     auto dml_sizes = ggml_to_dml_sizes(ggml_tensor);
     auto dml_strides = ggml_to_dml_strides(ggml_tensor);
-    auto size_in_bytes = DMLCalcBufferTensorSize(dml_datatype, dml_sizes.size(), dml_sizes.data(), dml_strides.data());
+    auto size_in_bytes = DMLCalcBufferTensorSize(dml_datatype, static_cast<uint32_t>(dml_sizes.size()), dml_sizes.data(), dml_strides.data());
 
     return dml::TensorDesc(dml_datatype, DML_TENSOR_FLAG_NONE, dml_sizes, dml_strides, size_in_bytes, 0);
 }
@@ -464,7 +527,7 @@ static std::tuple<dml::Expression, dml::Expression> broadcast_tensors(dml::Expre
     uint32_t bStride = 1;
 
     // Broadcast the tensors
-    for (int dim_index = aTensor.GetOutputDesc().sizes.size() - 1; dim_index >= 0; --dim_index) {
+    for (int dim_index = static_cast<int>(aTensor.GetOutputDesc().sizes.size() - 1); dim_index >= 0; --dim_index) {
         auto aDim = aTensor.GetOutputDesc().sizes[dim_index];
         auto bDim = bTensor.GetOutputDesc().sizes[dim_index];
         GGML_ASSERT(aDim == bDim || aDim == 1 || bDim == 1);
@@ -515,7 +578,7 @@ static dml::Expression create_matmul(dml::Graph& scope, const std::vector<dml::E
 static dml::Expression create_rmsnorm(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc, float epsilon) {
     GGML_ASSERT(node_inputs.size() == 1);
 
-    std::array<uint32_t, 1> axes = {node_inputs[0].GetOutputDesc().sizes.size() - 1};
+    std::array<uint32_t, 1> axes = {static_cast<uint32_t>(node_inputs[0].GetOutputDesc().sizes.size() - 1)};
 
     // The input order in GGML is reversed for MatMul
     auto result = dml::MeanVarianceNormalization(node_inputs[0], NullOpt, NullOpt, axes, true, false, epsilon);
@@ -557,7 +620,7 @@ static dml::Expression create_softmax(dml::Graph& scope, const std::vector<dml::
     GGML_ASSERT(max_bias == 0.0f);
 
     auto input = node_inputs[0];
-    std::array<uint32_t, 1> axes = {input.GetOutputDesc().sizes.size() - 1};
+    std::array<uint32_t, 1> axes = {static_cast<uint32_t>(input.GetOutputDesc().sizes.size() - 1)};
 
     if (node_inputs.size() == 2) {
         const auto& input_sizes = input.GetOutputDesc().sizes;
@@ -670,7 +733,7 @@ static DML_SCALAR_UNION generate_scalar_union(DML_TENSOR_DATA_TYPE dtype, double
         break;
 
     case DML_TENSOR_DATA_TYPE_FLOAT16: {
-        ggml_fp16_t float16_value = GGML_COMPUTE_FP32_TO_FP16(value);
+        ggml_fp16_t float16_value = GGML_COMPUTE_FP32_TO_FP16(static_cast<float>(value));
         const BYTE* float16_bytes = reinterpret_cast<const BYTE*>(&float16_value);
         std::copy(float16_bytes, float16_bytes + sizeof(float16_value), scalar.Bytes);
     }
@@ -790,7 +853,7 @@ static dml::Expression create_rope(
     int n_dims,
     float freq_base,
     float freq_scale,
-    float n_orig_ctx,
+    int n_orig_ctx,
     float ext_factor,
     float attn_factor,
     float beta_fast,
@@ -950,7 +1013,7 @@ static dml::Expression create_rope(
 }
 */
 
-static struct GraphInput {
+struct GraphInput {
     GraphInput(dml::Expression dml_tensor, void* raw_data, uint32_t index) : dml_tensor(dml_tensor), raw_data(raw_data), index(index) {}
     const dml::Expression dml_tensor;
     const void* raw_data;
@@ -961,13 +1024,23 @@ static float fp16_to_fp32(ggml_fp16_t value) {
     return static_cast<float>(GGML_COMPUTE_FP16_TO_FP32(value));
 }
 
+static std::shared_ptr<DmlOperator> find_operator(const NodeKey& new_node_key) {
+    for (const auto& old_op : s_directml_context->operator_cache) {
+        if (new_node_key == old_op.first) {
+            return old_op.second;
+        }
+    }
+
+    return {};
+}
+
 static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     auto * ctx = static_cast<ggml_directml_context *>(backend->context);
 
     std::unordered_map<ggml_tensor*, dml::Expression> nodes;
     std::vector<std::vector<ggml_tensor*>> operator_inputs;
     std::vector<std::vector<ggml_tensor*>> operator_outputs;
-    std::vector<std::unique_ptr<DmlOperator>> dml_operators;
+    std::vector<std::shared_ptr<DmlOperator>> dml_operators;
 
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         auto node = cgraph->nodes[node_index];
@@ -991,113 +1064,177 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         switch (node->op) {
             case GGML_OP_RMS_NORM:
                 {
-                    float epsilon;
-                    memcpy(&epsilon, node->op_params, sizeof(float));
-                    auto result = create_rmsnorm(scope, node_inputs, dml_output_desc, epsilon);
-                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
+                    auto node_key = make_node_key(node);
+                    auto dml_op = find_operator(node_key);
+
+                    if (!dml_op) {
+                        float epsilon;
+                        memcpy(&epsilon, node->op_params, sizeof(float));
+                        auto result = create_rmsnorm(scope, node_inputs, dml_output_desc, epsilon);
+                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                    }
+
+                    dml_operators.push_back(std::move(dml_op));
                 }
                 break;
             case GGML_OP_MUL_MAT:
                 {
-                    auto result = create_matmul(scope, node_inputs, dml_output_desc);
-                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
+                    auto node_key = make_node_key(node);
+                    auto dml_op = find_operator(node_key);
+
+                    if (!dml_op) {
+                        auto result = create_matmul(scope, node_inputs, dml_output_desc);
+                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                    }
+
+                    dml_operators.push_back(std::move(dml_op));
                 }
                 break;
             case GGML_OP_MUL:
                 {
-                    auto result = create_multiply(scope, node_inputs, dml_output_desc);
-                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
+                    auto node_key = make_node_key(node);
+                    auto dml_op = find_operator(node_key);
+
+                    if (!dml_op) {
+                        auto result = create_multiply(scope, node_inputs, dml_output_desc);
+                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                    }
+
+                    dml_operators.push_back(std::move(dml_op));
                 }
                 break;
             case GGML_OP_ROPE:
                 {
-                    const int n_dims     = ((int32_t *) node->op_params)[1];
-                    const int mode       = ((int32_t *) node->op_params)[2];
-                    const int n_orig_ctx = ((int32_t *) node->op_params)[4];
+                    auto node_key = make_node_key(node);
+                    auto dml_op = find_operator(node_key);
 
-                    float xpos_base;
-                    bool  xpos_down;
+                    if (!dml_op) {
+                        const int n_dims     = ((int32_t *) node->op_params)[1];
+                        const int mode       = ((int32_t *) node->op_params)[2];
+                        const int n_orig_ctx = ((int32_t *) node->op_params)[4];
 
-                    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
-                    memcpy(&freq_base,   (int32_t *) node->op_params +  5, sizeof(float));
-                    memcpy(&freq_scale,  (int32_t *) node->op_params +  6, sizeof(float));
-                    memcpy(&ext_factor,  (int32_t *) node->op_params +  7, sizeof(float));
-                    memcpy(&attn_factor, (int32_t *) node->op_params +  8, sizeof(float));
-                    memcpy(&beta_fast,   (int32_t *) node->op_params +  9, sizeof(float));
-                    memcpy(&beta_slow,   (int32_t *) node->op_params + 10, sizeof(float));
-                    memcpy(&xpos_base,   (int32_t *) node->op_params + 11, sizeof(float));
-                    memcpy(&xpos_down,   (int32_t *) node->op_params + 12, sizeof(bool));
-                    auto result = create_rope(scope, node_inputs, dml_output_desc, mode, n_dims, freq_base, freq_scale, n_orig_ctx, ext_factor, attn_factor, beta_fast, beta_slow, xpos_base, xpos_down);
-                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
+                        float xpos_base;
+                        bool  xpos_down;
+
+                        float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+                        memcpy(&freq_base,   (int32_t *) node->op_params +  5, sizeof(float));
+                        memcpy(&freq_scale,  (int32_t *) node->op_params +  6, sizeof(float));
+                        memcpy(&ext_factor,  (int32_t *) node->op_params +  7, sizeof(float));
+                        memcpy(&attn_factor, (int32_t *) node->op_params +  8, sizeof(float));
+                        memcpy(&beta_fast,   (int32_t *) node->op_params +  9, sizeof(float));
+                        memcpy(&beta_slow,   (int32_t *) node->op_params + 10, sizeof(float));
+                        memcpy(&xpos_base,   (int32_t *) node->op_params + 11, sizeof(float));
+                        memcpy(&xpos_down,   (int32_t *) node->op_params + 12, sizeof(bool));
+                        auto result = create_rope(scope, node_inputs, dml_output_desc, mode, n_dims, freq_base, freq_scale, n_orig_ctx, ext_factor, attn_factor, beta_fast, beta_slow, xpos_base, xpos_down);
+
+                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                    }
+
+                    dml_operators.push_back(std::move(dml_op));
                 }
                 break;
             case GGML_OP_CPY:
             case GGML_OP_CONT:
                 {
-                    auto result = create_copy(scope, node_inputs, dml_output_desc);
-                    dml_operators.push_back(std::move(result));
+                    auto node_key = make_node_key(node);
+                    auto dml_op = find_operator(node_key);
+
+                    if (!dml_op) {
+                        dml_op = create_copy(scope, node_inputs, dml_output_desc);
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                    }
+
+                    dml_operators.push_back(std::move(dml_op));
                 }
                 break;
             case GGML_OP_SOFT_MAX:
                 {
-                    float scale;
-                    memcpy(&scale, node->op_params, sizeof(float));
-                    float max_bias;
-                    memcpy(&max_bias, (float *) node->op_params + 1, sizeof(float));
-                    auto result = create_softmax(scope, node_inputs, dml_output_desc, scale, max_bias);
-                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
+                    auto node_key = make_node_key(node);
+                    auto dml_op = find_operator(node_key);
+
+                    if (!dml_op) {
+                        float scale;
+                        memcpy(&scale, node->op_params, sizeof(float));
+                        float max_bias;
+                        memcpy(&max_bias, (float *) node->op_params + 1, sizeof(float));
+                        auto result = create_softmax(scope, node_inputs, dml_output_desc, scale, max_bias);
+                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                    }
+
+                    dml_operators.push_back(std::move(dml_op));
                 }
                 break;
             case GGML_OP_ADD:
                 {
-                    auto result = create_add(scope, node_inputs, dml_output_desc);
-                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
+                    auto node_key = make_node_key(node);
+                    auto dml_op = find_operator(node_key);
+
+                    if (!dml_op) {
+                        auto result = create_add(scope, node_inputs, dml_output_desc);
+                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
+                    }
+
+                    dml_operators.push_back(std::move(dml_op));
                 }
                 break;
             case GGML_OP_UNARY:
                 {
-                    dml::Expression result;
+                    auto node_key = make_node_key(node);
+                    auto dml_op = find_operator(node_key);
 
-                    switch (ggml_get_unary_op(node)) {
-                    case GGML_UNARY_OP_RELU:
-                        result = create_relu(scope, node_inputs, dml_output_desc);
-                        break;
-                    case GGML_UNARY_OP_GELU_QUICK:
-                    case GGML_UNARY_OP_GELU:
-                        result = create_gelu(scope, node_inputs, dml_output_desc);
-                        break;
-                    case GGML_UNARY_OP_SILU:
-                        result = create_silu(scope, node_inputs, dml_output_desc);
-                        break;
-                    case GGML_UNARY_OP_ABS:
-                        result = create_abs(scope, node_inputs, dml_output_desc);
-                        break;
-                    case GGML_UNARY_OP_NEG:
-                        result = create_neg(scope, node_inputs, dml_output_desc);
-                        break;
-                    case GGML_UNARY_OP_TANH:
-                        result = create_tanh(scope, node_inputs, dml_output_desc);
-                        break;
-                    case GGML_UNARY_OP_ELU:
-                        result = create_elu(scope, node_inputs, dml_output_desc);
-                        break;
-                    case GGML_UNARY_OP_HARDSIGMOID:
-                        result = create_hardsigmoid(scope, node_inputs, dml_output_desc);
-                        break;
-                    case GGML_UNARY_OP_SGN:
-                        result = create_signum(scope, node_inputs, dml_output_desc);
-                        break;
-                    case GGML_UNARY_OP_STEP:
-                        result = create_step(scope, node_inputs, dml_output_desc);
-                        break;
-                    case GGML_UNARY_OP_HARDSWISH:
-                        result = create_hardswish(scope, node_inputs, dml_output_desc);
-                        break;
-                    default:
-                        THROW_HR(E_NOTIMPL);
+                    if (!dml_op) {
+                        dml::Expression result;
+
+                        switch (ggml_get_unary_op(node)) {
+                        case GGML_UNARY_OP_RELU:
+                            result = create_relu(scope, node_inputs, dml_output_desc);
+                            break;
+                        case GGML_UNARY_OP_GELU_QUICK:
+                        case GGML_UNARY_OP_GELU:
+                            result = create_gelu(scope, node_inputs, dml_output_desc);
+                            break;
+                        case GGML_UNARY_OP_SILU:
+                            result = create_silu(scope, node_inputs, dml_output_desc);
+                            break;
+                        case GGML_UNARY_OP_ABS:
+                            result = create_abs(scope, node_inputs, dml_output_desc);
+                            break;
+                        case GGML_UNARY_OP_NEG:
+                            result = create_neg(scope, node_inputs, dml_output_desc);
+                            break;
+                        case GGML_UNARY_OP_TANH:
+                            result = create_tanh(scope, node_inputs, dml_output_desc);
+                            break;
+                        case GGML_UNARY_OP_ELU:
+                            result = create_elu(scope, node_inputs, dml_output_desc);
+                            break;
+                        case GGML_UNARY_OP_HARDSIGMOID:
+                            result = create_hardsigmoid(scope, node_inputs, dml_output_desc);
+                            break;
+                        case GGML_UNARY_OP_SGN:
+                            result = create_signum(scope, node_inputs, dml_output_desc);
+                            break;
+                        case GGML_UNARY_OP_STEP:
+                            result = create_step(scope, node_inputs, dml_output_desc);
+                            break;
+                        case GGML_UNARY_OP_HARDSWISH:
+                            result = create_hardswish(scope, node_inputs, dml_output_desc);
+                            break;
+                        default:
+                            THROW_HR(E_NOTIMPL);
+                        }
+
+                        dml_op = std::make_shared<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator);
+                        s_directml_context->operator_cache.emplace_back(std::move(node_key), dml_op);
                     }
 
-                    dml_operators.push_back(std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context, *s_directml_context->allocator));
+                    dml_operators.push_back(std::move(dml_op));
                 }
                 break;
             case GGML_OP_TRANSPOSE:
@@ -1299,7 +1436,7 @@ ggml_backend_t ggml_backend_directml_init(int device) {
 
 static ggml_backend_t ggml_backend_reg_directml_init(const char * params, void * user_data) {
     GGML_UNUSED(params);
-    return ggml_backend_directml_init(intptr_t(user_data));
+    return ggml_backend_directml_init(static_cast<int>(intptr_t(user_data)));
 }
 
 extern "C" int ggml_backend_directml_reg_devices();

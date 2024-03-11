@@ -780,7 +780,7 @@ if (LLAMA_DIRECTML)
 
     FetchContent_Declare(
         directmlx
-        URL https://raw.githubusercontent.com/microsoft/DirectML/0db0c59dfef77c6c6256c059c1d001decdb9d9a6/Libraries/DirectMLX.h
+        URL https://raw.githubusercontent.com/microsoft/DirectML/db0633898b4730e492914d6e467097fe8b76c2bf/Libraries/DirectMLX.h
         DOWNLOAD_NO_EXTRACT 1
     )
 

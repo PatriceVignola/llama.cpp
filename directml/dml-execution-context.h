@@ -24,7 +24,7 @@ namespace Dml
             IDMLDevice* dmlDevice,
             ID3D12CommandQueue* queue);
 
-        void SetAllocator(std::weak_ptr<DmlGpuAllocator> allocator);
+        void SetAllocator(std::shared_ptr<DmlGpuAllocator> allocator);
 
         // Waits for flushed work, discards unflushed work, and discards associated references to
         // prevent circular references.  Must be the last call on the object before destruction.

@@ -38,9 +38,9 @@ DmlCommandRecorder::~DmlCommandRecorder()
     }
 }
 
-void DmlCommandRecorder::SetAllocator(std::weak_ptr<DmlGpuAllocator> allocator)
+void DmlCommandRecorder::SetAllocator(std::shared_ptr<DmlGpuAllocator> allocator)
 {
-    m_allocator = allocator;
+    m_allocator = std::move(allocator);
 }
 
 void DmlCommandRecorder::InitializeOperator(
@@ -73,8 +73,6 @@ void DmlCommandRecorder::InitializeOperator(
     UINT64 temporaryResourceSize = initBindingProps.TemporaryResourceSize;
     if (temporaryResourceSize > 0)
     {
-        auto allocator = m_allocator.lock();
-
         if (m_temporaryBuffer && m_temporaryBuffer->SizeInBytes() < temporaryResourceSize) {
             // The temporary buffer is not big enough, so delete it and create a new one
             auto managedTemporaryBuffer = wil::MakeOrThrow<Dml::DmlManagedBuffer>(std::move(*m_temporaryBuffer));
@@ -83,7 +81,7 @@ void DmlCommandRecorder::InitializeOperator(
         }
 
         if (!m_temporaryBuffer) {
-            m_temporaryBuffer = allocator->AllocateDefaultBuffer(temporaryResourceSize);
+            m_temporaryBuffer = m_allocator->AllocateDefaultBuffer(temporaryResourceSize);
         }
 
         // Bind the temporary resource.
@@ -149,8 +147,6 @@ void DmlCommandRecorder::ExecuteGraphOperator(
     UINT64 temporaryResourceSize = execBindingProps.TemporaryResourceSize;
     if (temporaryResourceSize > 0)
     {
-        auto allocator = m_allocator.lock();
-
         if (m_temporaryBuffer && m_temporaryBuffer->SizeInBytes() < temporaryResourceSize) {
             // The temporary buffer is not big enough, so delete it and create a new one
             auto managedTemporaryBuffer = wil::MakeOrThrow<Dml::DmlManagedBuffer>(std::move(*m_temporaryBuffer));
@@ -159,7 +155,7 @@ void DmlCommandRecorder::ExecuteGraphOperator(
         }
 
         if (!m_temporaryBuffer) {
-            m_temporaryBuffer = allocator->AllocateDefaultBuffer(temporaryResourceSize);
+            m_temporaryBuffer = m_allocator->AllocateDefaultBuffer(temporaryResourceSize);
         }
 
         // Bind the temporary resource.

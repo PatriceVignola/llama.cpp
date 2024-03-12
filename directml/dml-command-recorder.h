@@ -73,7 +73,7 @@ namespace Dml
         void Open();
         void CloseAndExecute();
 
-        void SetAllocator(std::weak_ptr<DmlGpuAllocator> allocator);
+        void SetAllocator(std::shared_ptr<DmlGpuAllocator> allocator);
 
         bool HasUnsubmittedWork()
         {
@@ -112,7 +112,7 @@ namespace Dml
         ID3D12DescriptorHeap* m_currentDescriptorHeap = nullptr;
 
         // The weak pointer avoids a circular reference from context->recorder->allocator->context
-        std::weak_ptr<DmlGpuAllocator> m_allocator;
+        std::shared_ptr<DmlGpuAllocator> m_allocator;
 
         // The command list currently being recorded into, and whether any command have been recorded yet.
         ComPtr<ID3D12GraphicsCommandList> m_currentCommandList;

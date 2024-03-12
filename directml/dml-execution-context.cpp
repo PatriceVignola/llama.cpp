@@ -20,9 +20,9 @@ namespace Dml
         THROW_IF_FAILED(dmlDevice->GetParentDevice(IID_PPV_ARGS(m_d3dDevice.GetAddressOf())));
     }
 
-    void ExecutionContext::SetAllocator(std::weak_ptr<DmlGpuAllocator> allocator)
+    void ExecutionContext::SetAllocator(std::shared_ptr<DmlGpuAllocator> allocator)
     {
-        m_dmlRecorder.SetAllocator(allocator);
+        m_dmlRecorder.SetAllocator(std::move(allocator));
     }
 
     void ExecutionContext::CopyBufferRegion(

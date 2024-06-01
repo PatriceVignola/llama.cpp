@@ -742,8 +742,9 @@ if (LLAMA_DIRECTML)
 
     set(NUGET_CONFIG ${PROJECT_SOURCE_DIR}/directml/nuget.config)
     set(PACKAGES_CONFIG ${PROJECT_SOURCE_DIR}/directml/packages.config)
+
     get_filename_component(PACKAGES_DIR ${CMAKE_CURRENT_BINARY_DIR}/packages ABSOLUTE)
-    set(DML_PACKAGE_DIR ${PACKAGES_DIR}/Microsoft.AI.DirectML.1.13.1)
+    set(DML_PACKAGE_DIR ${PACKAGES_DIR}/Microsoft.AI.DirectML.1.14.2)
     set(DXC_PACKAGE_DIR ${PACKAGES_DIR}/Microsoft.Direct3D.DXC.1.7.2308.12)
 
     # Restore nuget packages, which will pull down the DirectML redist package.
@@ -780,7 +781,7 @@ if (LLAMA_DIRECTML)
 
     FetchContent_Declare(
         directmlx
-        URL https://raw.githubusercontent.com/microsoft/DirectML/db0633898b4730e492914d6e467097fe8b76c2bf/Libraries/DirectMLX.h
+        URL https://raw.githubusercontent.com/microsoft/DirectML/aac95824151adcd7e039043438785fab30ace13d/Libraries/DirectMLX.h
         DOWNLOAD_NO_EXTRACT 1
     )
 
@@ -1238,6 +1239,11 @@ add_library(ggml_static STATIC $<TARGET_OBJECTS:ggml>)
 if (LLAMA_DIRECTML)
     add_dependencies(ggml_static RESTORE_PACKAGES)
     target_link_libraries(ggml_static PRIVATE "${DML_PACKAGE_DIR}/bin/x64-win/DirectML.lib" "${DML_PACKAGE_DIR}/bin/x64-win/DirectML.dll")
+
+    add_custom_command(TARGET ggml_static POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DML_PACKAGE_DIR}/bin/x64-win/DirectML.dll"
+            "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/DirectML.dll")
 endif()
 
 if (BUILD_SHARED_LIBS)

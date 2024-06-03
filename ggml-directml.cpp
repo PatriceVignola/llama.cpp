@@ -85,6 +85,25 @@ struct AdapterInfo {
     DeviceType Type; // GPU or NPU
 };
 
+enum class VendorID
+{
+    kMicrosoft = 0x1414,
+};
+
+static bool IsSoftwareAdapter(IDXCoreAdapter* adapter) {
+    bool is_hardware_adapter = false;
+    THROW_IF_FAILED(adapter->GetProperty( DXCoreAdapterProperty::IsHardware, &is_hardware_adapter));
+
+    DXCoreHardwareID hardware_id = {};
+    THROW_IF_FAILED(adapter->GetProperty(DXCoreAdapterProperty::HardwareID, &hardware_id));
+
+    // See here for documentation on filtering WARP adapter:
+    // https://docs.microsoft.com/en-us/windows/desktop/direct3ddxgi/d3d10-graphics-programming-guide-dxgi#new-info-about-enumerating-adapters-for-windows-8
+    const bool is_basic_render_driver_vendor_id = hardware_id.vendorID == static_cast<uint32_t>(VendorID::kMicrosoft);
+    const bool is_basic_render_driver_device_id = hardware_id.deviceID == 0x8c;
+    return !is_hardware_adapter || (is_basic_render_driver_vendor_id && is_basic_render_driver_device_id);
+};
+
 static std::vector<AdapterInfo> FilterDXCoreAdapters(IDXCoreAdapterList* adapter_list) {
     auto adapter_infos = std::vector<AdapterInfo>();
     const uint32_t count = adapter_list->GetAdapterCount();
@@ -92,8 +111,10 @@ static std::vector<AdapterInfo> FilterDXCoreAdapters(IDXCoreAdapterList* adapter
         ComPtr<IDXCoreAdapter> candidate_adapter;
         THROW_IF_FAILED(adapter_list->GetAdapter(i, candidate_adapter.GetAddressOf()));
 
-        // Add the adapters that are valid based on the device filter (GPU, NPU, or Both)
-        adapter_infos.push_back(AdapterInfo{candidate_adapter, DeviceType::GPU});
+        if (!IsSoftwareAdapter(candidate_adapter.Get())) {
+            // Add the adapters that are valid based on the device filter (GPU, NPU, or Both)
+            adapter_infos.push_back(AdapterInfo{candidate_adapter, DeviceType::GPU});
+        }
     }
 
     return adapter_infos;

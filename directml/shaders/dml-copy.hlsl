@@ -42,6 +42,6 @@ void main(uint3 dtid : SV_DispatchThreadID)
         const uint32_t4 outputIndices = GetCoordinatesFromLogicalIndex(globalIndex, outputSizes);
         const uint inputElementOffset = GetOffsetFromCoordinates(inputIndices, inputStrides);
         const uint outputElementOffset = GetOffsetFromCoordinates(outputIndices, outputStrides);
-        output[outputElementOffset] = input[inputElementOffset];
+        output[outputElementOffset] = (TOUT)input[inputElementOffset];
     }
 }

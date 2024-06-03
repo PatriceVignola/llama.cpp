@@ -745,7 +745,7 @@ if (LLAMA_DIRECTML)
 
     get_filename_component(PACKAGES_DIR ${CMAKE_CURRENT_BINARY_DIR}/packages ABSOLUTE)
     set(DML_PACKAGE_DIR ${PACKAGES_DIR}/Microsoft.AI.DirectML.1.14.2)
-    set(DXC_PACKAGE_DIR ${PACKAGES_DIR}/Microsoft.Direct3D.DXC.1.7.2308.12)
+    set(DXC_PACKAGE_DIR ${PACKAGES_DIR}/Microsoft.Direct3D.DXC.1.8.2405.17)
 
     # Restore nuget packages, which will pull down the DirectML redist package.
     add_custom_command(

@@ -92,3 +92,5 @@ examples/jeopardy/results.txt
 poetry.lock
 poetry.toml
 nppBackup
+
+!generate_directml_shaders.bat

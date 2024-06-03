@@ -355,6 +355,13 @@ static ggml_directml_memory ggml_directml_allocate(size_t size) {
     ggml_directml_memory memory;
     memory.data = s_directml_context->allocator->Alloc(size);
     memory.size = size;
+
+    auto bufferRegion = s_directml_context->allocator->CreateBufferRegion(memory.data, memory.size );
+    ID3D12Resource* dstData = bufferRegion.GetD3D12Resource();
+
+    uint8_t pattern = 0;
+    s_directml_context->execution_context->FillBufferWithPattern(dstData, bufferRegion.Offset(), &pattern, sizeof(pattern));
+
     return memory;
 }
 
@@ -398,8 +405,12 @@ static void ggml_backend_directml_buffer_get_tensor(ggml_backend_buffer_t buffer
 }
 
 static void ggml_backend_directml_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
-    // TODO (pavignol): Implement me (set pattern to value)
-    printf("ggml_backend_directml_buffer_clear\n");
+    auto* tensor = (ggml_directml_memory *)buffer->context;
+
+    auto bufferRegion = s_directml_context->allocator->CreateBufferRegion(tensor->data, tensor->size);
+    ID3D12Resource* dstData = bufferRegion.GetD3D12Resource();
+
+    s_directml_context->execution_context->FillBufferWithPattern(dstData, bufferRegion.Offset(), &value, sizeof(value));
 }
 
 static void ggml_backend_directml_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
@@ -1058,8 +1069,6 @@ static DmlOperator* find_operator(const NodeKey& new_node_key) {
 }
 
 static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    auto * ctx = static_cast<ggml_directml_context *>(backend->context);
-
     std::unordered_map<ggml_tensor*, dml::Expression> nodes;
     std::vector<std::vector<ggml_tensor*>> operator_inputs;
     std::vector<std::vector<ggml_tensor*>> operator_outputs;

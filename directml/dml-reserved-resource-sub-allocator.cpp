@@ -104,7 +104,7 @@ namespace Dml
                 heapSizeInBytes,
                 m_heapProperties,
                 0,
-                m_heapFlags);
+                m_heapFlags | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES);
 
             HRESULT createHeapHr = m_device->CreateHeap(&heap_desc, IID_PPV_ARGS(&allocation->heaps[i]));
             if (createHeapHr == E_OUTOFMEMORY)

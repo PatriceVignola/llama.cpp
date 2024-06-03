@@ -1244,6 +1244,11 @@ if (LLAMA_DIRECTML)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${DML_PACKAGE_DIR}/bin/x64-win/DirectML.dll"
             "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/DirectML.dll")
+
+    add_custom_command(TARGET ggml_static POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${DML_PACKAGE_DIR}/bin/x64-win/DirectML.Debug.dll"
+            "${CMAKE_BINARY_DIR}/bin/$<CONFIG>/DirectML.Debug.dll")
 endif()
 
 if (BUILD_SHARED_LIBS)

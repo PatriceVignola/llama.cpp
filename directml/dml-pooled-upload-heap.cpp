@@ -5,6 +5,7 @@
 
 #include <assert.h>
 #include <wil/result.h>
+#include <functional>
 #include "dml-pooled-upload-heap.h"
 #include "dml-execution-context.h"
 
@@ -164,7 +165,8 @@ namespace Dml
         uint64_t dstOffset,
         D3D12_RESOURCE_STATES dstState,
         const uint8_t* src,
-        uint64_t size)
+        uint64_t size,
+        std::function<void(byte* uploadHeapData, const uint8_t* srcData)> customCopy)
     {
         assert(size != 0);
         assert(dst->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
@@ -182,7 +184,12 @@ namespace Dml
         // Map the upload heap and copy the source data into it at the specified offset
         void* uploadHeapData = nullptr;
         THROW_IF_FAILED(chunk->resource->Map(0, nullptr, &uploadHeapData));
-        memcpy(static_cast<byte*>(uploadHeapData) + offsetInChunk, src, size);
+
+        if (customCopy) {
+            customCopy(static_cast<byte*>(uploadHeapData) + offsetInChunk, src);
+        } else {
+            memcpy(static_cast<byte*>(uploadHeapData) + offsetInChunk, src, size);
+        }
         chunk->resource->Unmap(0, nullptr);
 
         // Copy from the upload heap into the destination resource

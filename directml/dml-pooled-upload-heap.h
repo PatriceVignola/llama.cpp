@@ -26,7 +26,8 @@ namespace Dml
             uint64_t dstOffset,
             D3D12_RESOURCE_STATES dstState,
             const uint8_t* src,
-            uint64_t size);
+            uint64_t size,
+            std::function<void(byte* uploadHeapData, const uint8_t* srcData)> customCopy = nullptr);
 
         // Releases unused capacity.
         void Trim();

@@ -824,8 +824,6 @@ if (LLAMA_DIRECTML)
         directml/dml-operator.h
         directml/dml-pooled-upload-heap.cpp
         directml/dml-pooled-upload-heap.h
-        directml/dml-quant-tensor-preprocessor.cpp
-        directml/dml-quant-tensor-preprocessor.h
         directml/dml-readback-heap.cpp
         directml/dml-readback-heap.h
         directml/dml-reserved-resource-allocator-wrapper.h

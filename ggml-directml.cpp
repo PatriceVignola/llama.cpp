@@ -402,18 +402,31 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
     ID3D12Resource* dstData = bufferRegion.GetD3D12Resource();
     const auto dstState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; // GPU resources are always kept in UAV state
 
-    if (ggml_is_quantized(tensor->type)) {
-        if (tensor->type != GGML_TYPE_Q8_0) {
+    if (ggml_is_quantized(tensor->type) && tensor->type != GGML_TYPE_Q6_K) {
+        uint32_t block_size;
+        uint32_t packed_element_count;
+
+        switch (tensor->type) {
+        case GGML_TYPE_Q8_0:
+            block_size = QK8_0;
+            packed_element_count = 1;
+            break;
+
+        case GGML_TYPE_Q4_0:
+            block_size = QK4_0;
+            packed_element_count = 2;
+            break;
+
+        default:
             THROW_HR(E_NOTIMPL);
         }
 
         const uint32_t num_quantized_elements = std::accumulate(tensor->ne, tensor->ne + GGML_MAX_DIMS, 1LL, std::multiplies<int64_t>());
 
-        auto preprocess = [num_quantized_elements](byte* uploadHeapData, const uint8_t* srcData) {
-            const uint32_t block_size = QK8_0;
+        auto preprocess = [num_quantized_elements, block_size, packed_element_count](byte* uploadHeapData, const uint8_t* srcData) {
             const uint32_t num_blocks = num_quantized_elements / block_size;
             uint32_t preprocessed_quantized_index = 0;
-            uint32_t preprocessed_scale_index = num_quantized_elements * sizeof(int8_t);
+            uint32_t preprocessed_scale_index = num_quantized_elements * sizeof(int8_t) / packed_element_count;
             auto dst_bytes = reinterpret_cast<int8_t*>(uploadHeapData);
             auto src_bytes = reinterpret_cast<const int8_t*>(srcData);
 
@@ -422,9 +435,9 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
                 src_bytes += sizeof(ggml_fp16_t);
                 preprocessed_scale_index += sizeof(ggml_fp16_t);//
 
-                memcpy(dst_bytes + preprocessed_quantized_index, src_bytes, block_size * sizeof(int8_t));
-                src_bytes += block_size * sizeof(int8_t);
-                preprocessed_quantized_index += block_size * sizeof(int8_t);
+                memcpy(dst_bytes + preprocessed_quantized_index, src_bytes, block_size * sizeof(int8_t) / packed_element_count);
+                src_bytes += block_size * sizeof(int8_t) / packed_element_count;
+                preprocessed_quantized_index += block_size * sizeof(int8_t) / packed_element_count;
             }
         };
 
@@ -541,6 +554,18 @@ static DML_TENSOR_DATA_TYPE ggml_to_dml_datatype(ggml_type ggml_datatype) {
         case GGML_TYPE_F16: return DML_TENSOR_DATA_TYPE_FLOAT16;
         case GGML_TYPE_I32: return DML_TENSOR_DATA_TYPE_INT32;
         case GGML_TYPE_Q8_0: return DML_TENSOR_DATA_TYPE_INT8;
+        case GGML_TYPE_Q4_0: return DML_TENSOR_DATA_TYPE_UINT4;
+        default: {
+            THROW_HR(E_NOTIMPL);
+            break;
+        }
+    }
+}
+
+static uint32_t get_quant_block_size(ggml_type ggml_datatype) {
+    switch (ggml_datatype) {
+        case GGML_TYPE_Q8_0: return QK8_0;
+        case GGML_TYPE_Q4_0: return QK4_0;
         default: {
             THROW_HR(E_NOTIMPL);
             break;
@@ -1160,16 +1185,16 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                 break;
             }
 
-            if (ggml_is_quantized(node->src[src_index]->type)) {
-                if (node->src[src_index]->type != GGML_TYPE_Q8_0) {
-                    THROW_HR(E_NOTIMPL);
-                }
-
+            if (node->src[src_index]->type == GGML_TYPE_Q6_K) {
+                // TODO (pavignol): Implement me
+                THROW_HR(E_NOTIMPL);
+            } else if (ggml_is_quantized(node->src[src_index]->type)) {
                 auto quantized_tensor_sizes = ggml_to_dml_sizes(node->src[src_index]);
                 auto scale_tensor_sizes = quantized_tensor_sizes;
-                scale_tensor_sizes.back() /= QK8_0;
+                scale_tensor_sizes.back() /= get_quant_block_size(node->src[src_index]->type);
 
-                input_tensors.push_back(dml::TensorDesc(DML_TENSOR_DATA_TYPE_INT8, quantized_tensor_sizes));
+                const auto quantized_data_type = ggml_to_dml_datatype(node->src[src_index]->type);
+                input_tensors.push_back(dml::TensorDesc(quantized_data_type, quantized_tensor_sizes));
                 node_inputs.push_back(dml::InputTensor(scope, dml_index++, input_tensors.back()));
 
                 input_tensors.push_back(dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT16, scale_tensor_sizes));
@@ -1211,11 +1236,18 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         dml::Expression result;
 
                         if (ggml_is_quantized(node->src[0]->type)) {
-                            if (node->src[0]->type != GGML_TYPE_Q8_0) {
+                            DML_QUANTIZATION_TYPE quantization_type;
+
+                            switch (node->src[0]->type) {
+                            case GGML_TYPE_Q4_0:
+                            case GGML_TYPE_Q8_0:
+                                quantization_type = DML_QUANTIZATION_TYPE_SCALE;
+                                break;
+                            default:
                                 THROW_HR(E_NOTIMPL);
                             }
 
-                            result = create_quantized_matmul(scope, node_inputs, dml_output_desc, DML_QUANTIZATION_TYPE_SCALE);
+                            result = create_quantized_matmul(scope, node_inputs, dml_output_desc, quantization_type);
                         } else {
                             result = create_matmul(scope, node_inputs, dml_output_desc);
                         }
@@ -1414,14 +1446,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         inputBufferRegions.reserve(current_operator_inputs.size());
         for (const auto& operator_input : current_operator_inputs) {
              if (ggml_is_quantized(operator_input->type)) {
-                if (operator_input->type != GGML_TYPE_Q8_0) {
-                    THROW_HR(E_NOTIMPL);
-                }
-
                 auto quantized_tensor_sizes = ggml_to_dml_sizes(operator_input);
                 auto scale_tensor_sizes = quantized_tensor_sizes;
-                scale_tensor_sizes.back() /= QK8_0;
+                scale_tensor_sizes.back() /= get_quant_block_size(operator_input->type);
 
+                const auto quantized_data_type = ggml_to_dml_datatype(operator_input->type);
                 auto quantized_tensor_desc = dml::TensorDesc(DML_TENSOR_DATA_TYPE_INT8, quantized_tensor_sizes);
                 auto scale_tensor_desc = dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT16, scale_tensor_sizes);
 

@@ -11,6 +11,7 @@
 #include "ggml-directml.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 
 #define DML_TARGET_VERSION 0x6300
 
@@ -33,8 +34,13 @@
 #include "directml/dml-copy-operator.h"
 #include "directml/dml-operator.h"
 #include "directml/dml-graph-operator.h"
+#include "directml/dml-quant-tensor-preprocessor.h"
 
 using Microsoft::WRL::ComPtr;
+
+dml::TensorDesc ggml_to_dml_tensor_desc(const ggml_tensor* ggml_tensor);
+dml::TensorDimensions ggml_to_dml_sizes(const ggml_tensor* ggml_tensor);
+dml::TensorStrides ggml_to_dml_strides(const ggml_tensor* ggml_tensor);
 
 void ggml_init_directml() {
     // TODO (pavignol): Implement me
@@ -349,6 +355,19 @@ static directml_manager directmlManager;
 struct ggml_directml_memory {
     void* data;
     size_t size = 0;
+
+    ggml_directml_memory() = default;
+    ggml_directml_memory(ggml_directml_memory&& other) {
+        data = other.data;
+        size = other.size;
+        other.data = nullptr;
+    }
+
+    ~ggml_directml_memory() {
+        if (s_directml_context && data) {
+            s_directml_context->allocator->Free(data);
+        }
+    }
 };
 
 static ggml_directml_memory ggml_directml_allocate(size_t size) {
@@ -372,11 +391,6 @@ static const char * ggml_backend_directml_buffer_get_name(ggml_backend_buffer_t 
 
 static void ggml_backend_directml_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * memory = (ggml_directml_memory *)buffer->context;
-
-    if (s_directml_context) {
-        s_directml_context->allocator->Free(memory->data);
-    }
-
     delete memory;
 }
 
@@ -391,7 +405,89 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
     const auto dstState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; // GPU resources are always kept in UAV state
     s_directml_context->upload_heap.BeginUploadToGpu(dstData, bufferRegion.Offset() + offset, dstState, reinterpret_cast<const uint8_t*>(srcData), size);
 
-    // TODO (pavignol): Optimize by not flushing as often
+    if (ggml_is_quantized(tensor->type)) {
+        // TODO (pavignol): Make this part faster
+        if (tensor->type != GGML_TYPE_Q8_0) {
+            THROW_HR(E_NOTIMPL);
+        }
+
+        auto quantized_sizes = ggml_to_dml_sizes(tensor);
+        auto scale_strides = ggml_to_dml_strides(tensor);
+
+        // The strides will be based on the number of individual elements, so we need to adjust them
+        for (auto& scale_stride : scale_strides) {
+            scale_stride /= sizeof(block_q8_0);
+        }
+
+        // ggml's sizes are based on individual elements (not blocks), so we need to adjust them
+        auto scale_sizes = quantized_sizes;
+        scale_sizes.back() /= QK8_0;
+
+        const uint64_t quantized_tensor_size_in_bytes = dml::TensorDesc(DML_TENSOR_DATA_TYPE_INT8, quantized_sizes).totalTensorSizeInBytes;
+        const uint64_t scale_tensor_size_in_bytes = dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT16, scale_sizes).totalTensorSizeInBytes;
+        std::vector<Dml::D3D12BufferRegion> inputBufferRegions = {bufferRegion};
+
+        auto heap_props = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+
+        ComPtr<ID3D12Resource> quantized_resource;
+        auto quantized_buffer = CD3DX12_RESOURCE_DESC::Buffer(quantized_tensor_size_in_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        THROW_IF_FAILED(s_directml_context->d3d12_device->CreateCommittedResource(
+            &heap_props,
+            D3D12_HEAP_FLAG_NONE,
+            &quantized_buffer,
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            IID_PPV_ARGS(quantized_resource.GetAddressOf())
+        ));
+
+        ComPtr<ID3D12Resource> scale_resource;
+        auto scale_buffer = CD3DX12_RESOURCE_DESC::Buffer(scale_tensor_size_in_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        THROW_IF_FAILED(s_directml_context->d3d12_device->CreateCommittedResource(
+            &heap_props,
+            D3D12_HEAP_FLAG_NONE,
+            &scale_buffer,
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            IID_PPV_ARGS(scale_resource.GetAddressOf())
+        ));
+
+        auto quantized_buffer_region = Dml::D3D12BufferRegion(0, quantized_tensor_size_in_bytes, quantized_resource.Get());
+        auto scale_buffer_region = Dml::D3D12BufferRegion(0, scale_tensor_size_in_bytes, scale_resource.Get());
+        std::vector<Dml::D3D12BufferRegion> outputBufferRegions = {quantized_buffer_region, scale_buffer_region};
+
+        // Split the scale tensor from the actual quantized data
+        auto quant_tensor_preprocessor = wil::MakeOrThrow<DmlQuantTensorPreprocessor>(
+            s_directml_context->d3d12_device.Get(),
+            s_directml_context->execution_context.get(),
+            scale_sizes,
+            scale_strides);
+        quant_tensor_preprocessor->Execute(inputBufferRegions, outputBufferRegions);
+
+        // Copy the temporary tensors back to the original tensor
+        s_directml_context->execution_context->CopyBufferRegion(
+            bufferRegion.GetD3D12Resource(),
+            bufferRegion.Offset(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            quantized_buffer_region.GetD3D12Resource(),
+            quantized_buffer_region.Offset(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            quantized_buffer_region.SizeInBytes()
+        );
+
+        s_directml_context->execution_context->CopyBufferRegion(
+            bufferRegion.GetD3D12Resource(),
+            bufferRegion.Offset() + quantized_buffer_region.SizeInBytes(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            scale_buffer_region.GetD3D12Resource(),
+            scale_buffer_region.Offset(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            scale_buffer_region.SizeInBytes()
+        );
+
+        s_directml_context->execution_context->QueueReference(quantized_resource.Get());
+        s_directml_context->execution_context->QueueReference(scale_resource.Get());
+    }
+
     s_directml_context->execution_context->Flush();
 }
 
@@ -499,6 +595,7 @@ static DML_TENSOR_DATA_TYPE ggml_to_dml_datatype(ggml_type ggml_datatype) {
         case GGML_TYPE_F32: return DML_TENSOR_DATA_TYPE_FLOAT32;
         case GGML_TYPE_F16: return DML_TENSOR_DATA_TYPE_FLOAT16;
         case GGML_TYPE_I32: return DML_TENSOR_DATA_TYPE_INT32;
+        case GGML_TYPE_Q8_0: return DML_TENSOR_DATA_TYPE_INT8;
         default: {
             THROW_HR(E_NOTIMPL);
             break;
@@ -511,6 +608,7 @@ static size_t get_data_type_size(DML_TENSOR_DATA_TYPE dml_datatype) {
         case DML_TENSOR_DATA_TYPE_FLOAT32: return sizeof(float);
         case DML_TENSOR_DATA_TYPE_FLOAT16: return sizeof(ggml_fp16_t);
         case DML_TENSOR_DATA_TYPE_INT32: return sizeof(int32_t);
+        case DML_TENSOR_DATA_TYPE_INT8: return sizeof(int8_t);
         default: {
             THROW_HR(E_NOTIMPL);
             break;
@@ -595,6 +693,35 @@ static dml::Expression create_matmul(dml::Graph& scope, const std::vector<dml::E
     // The input order in GGML is reversed for MatMul
     auto aTensor = node_inputs[1];
     auto bTensor = node_inputs[0];
+
+    // TODO (pavignol): Instead of doing this, cast all fp32 weights once at the beginning and use only fp16 tensors in the graph
+    if (aTensor.GetOutputDesc().dataType != output_tensor_desc.dataType) {
+        aTensor = dml::Cast(aTensor, output_tensor_desc.dataType);
+    }
+
+    if (bTensor.GetOutputDesc().dataType != output_tensor_desc.dataType) {
+        bTensor = dml::Cast(bTensor, output_tensor_desc.dataType);
+    }
+
+    auto result = dml::Gemm(aTensor, bTensor, NullOpt, DML_MATRIX_TRANSFORM_NONE, DML_MATRIX_TRANSFORM_TRANSPOSE);
+    return result;
+}
+
+static dml::Expression create_quantized_matmul(
+    dml::Graph& scope,
+    const std::vector<dml::Expression>& node_inputs,
+    const dml::TensorDesc& output_tensor_desc,
+    DML_QUANTIZATION_TYPE quantization_type
+) {
+    GGML_ASSERT(node_inputs.size() == 3);
+
+    // The input order in GGML is reversed for MatMul
+    auto aTensor = node_inputs[2];
+    auto bTensor = node_inputs[0];
+    auto scaleTensor = node_inputs[1];
+
+    dml::Expression quantization_parameters[1] = {scaleTensor};
+    bTensor = dml::Dequantize(bTensor, quantization_parameters, quantization_type);
 
     // TODO (pavignol): Instead of doing this, cast all fp32 weights once at the beginning and use only fp16 tensors in the graph
     if (aTensor.GetOutputDesc().dataType != output_tensor_desc.dataType) {
@@ -1080,13 +1207,32 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 
         std::vector<dml::TensorDesc> input_tensors;
         std::vector<dml::Expression> node_inputs;
+
+        uint32_t dml_index = 0;
+
         for (int src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
             if (!node->src[src_index] || (node->op == GGML_OP_CPY && src_index == 1)) {
                 break;
             }
 
-            input_tensors.push_back(ggml_to_dml_tensor_desc(node->src[src_index]));
-            node_inputs.push_back(dml::InputTensor(scope, src_index, input_tensors[src_index]));
+            if (ggml_is_quantized(node->src[src_index]->type)) {
+                if (node->src[src_index]->type != GGML_TYPE_Q8_0) {
+                    THROW_HR(E_NOTIMPL);
+                }
+
+                auto quantized_tensor_sizes = ggml_to_dml_sizes(node->src[src_index]);
+                auto scale_tensor_sizes = quantized_tensor_sizes;
+                scale_tensor_sizes.back() /= QK8_0;
+
+                input_tensors.push_back(dml::TensorDesc(DML_TENSOR_DATA_TYPE_INT8, quantized_tensor_sizes));
+                node_inputs.push_back(dml::InputTensor(scope, dml_index++, input_tensors.back()));
+
+                input_tensors.push_back(dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT16, scale_tensor_sizes));
+                node_inputs.push_back(dml::InputTensor(scope, dml_index++, input_tensors.back()));
+            } else {
+                input_tensors.push_back(ggml_to_dml_tensor_desc(node->src[src_index]));
+                node_inputs.push_back(dml::InputTensor(scope, dml_index++, input_tensors.back()));
+            }
         }
 
         auto dml_output_desc = ggml_to_dml_tensor_desc(node);
@@ -1117,7 +1263,18 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     auto dml_op = find_operator(node_key);
 
                     if (!dml_op) {
-                        auto result = create_matmul(scope, node_inputs, dml_output_desc);
+                        dml::Expression result;
+
+                        if (ggml_is_quantized(node->src[0]->type)) {
+                            if (node->src[0]->type != GGML_TYPE_Q8_0) {
+                                THROW_HR(E_NOTIMPL);
+                            }
+
+                            result = create_quantized_matmul(scope, node_inputs, dml_output_desc, DML_QUANTIZATION_TYPE_SCALE);
+                        } else {
+                            result = create_matmul(scope, node_inputs, dml_output_desc);
+                        }
+
                         auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
                         dml_op = cache_dml_op.get();
                         s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
@@ -1294,7 +1451,9 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         if (!is_no_op) {
             std::vector<ggml_tensor*> current_inputs;
             for (int src_index = 0; src_index < node_inputs.size(); ++src_index) {
-                current_inputs.push_back(node->src[src_index]);
+                if (node->src[src_index]) {
+                    current_inputs.push_back(node->src[src_index]);
+                }
             }
 
             operator_inputs.push_back(std::move(current_inputs));
@@ -1309,8 +1468,27 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         std::vector<Dml::D3D12BufferRegion> inputBufferRegions;
         inputBufferRegions.reserve(current_operator_inputs.size());
         for (const auto& operator_input : current_operator_inputs) {
-            auto input_buffer_region = s_directml_context->allocator->CreateBufferRegion(operator_input->data, ggml_to_dml_tensor_desc(operator_input).totalTensorSizeInBytes);
-            inputBufferRegions.push_back(std::move(input_buffer_region));
+             if (ggml_is_quantized(operator_input->type)) {
+                if (operator_input->type != GGML_TYPE_Q8_0) {
+                    THROW_HR(E_NOTIMPL);
+                }
+
+                auto quantized_tensor_sizes = ggml_to_dml_sizes(operator_input);
+                auto scale_tensor_sizes = quantized_tensor_sizes;
+                scale_tensor_sizes.back() /= QK8_0;
+
+                auto quantized_tensor_desc = dml::TensorDesc(DML_TENSOR_DATA_TYPE_INT8, quantized_tensor_sizes);
+                auto scale_tensor_desc = dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT16, scale_tensor_sizes);
+
+                auto quantized_buffer_region = s_directml_context->allocator->CreateBufferRegion(operator_input->data, quantized_tensor_desc.totalTensorSizeInBytes);
+                auto scale_buffer_region = Dml::D3D12BufferRegion(quantized_buffer_region.Offset() + quantized_tensor_desc.totalTensorSizeInBytes, scale_tensor_desc.totalTensorSizeInBytes, quantized_buffer_region.GetD3D12Resource());
+
+                inputBufferRegions.push_back(std::move(quantized_buffer_region));
+                inputBufferRegions.push_back(std::move(scale_buffer_region));
+            } else {
+                auto input_buffer_region = s_directml_context->allocator->CreateBufferRegion(operator_input->data, ggml_to_dml_tensor_desc(operator_input).totalTensorSizeInBytes);
+                inputBufferRegions.push_back(std::move(input_buffer_region));
+            }
         }
 
         std::vector<Dml::D3D12BufferRegion> outputBufferRegions;

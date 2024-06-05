@@ -456,12 +456,12 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
         std::vector<Dml::D3D12BufferRegion> outputBufferRegions = {quantized_buffer_region, scale_buffer_region};
 
         // Split the scale tensor from the actual quantized data
-        auto quant_tensor_preprocessor = wil::MakeOrThrow<DmlQuantTensorPreprocessor>(
+        DmlQuantTensorPreprocessor quant_tensor_preprocessor(
             s_directml_context->d3d12_device.Get(),
             s_directml_context->execution_context.get(),
             scale_sizes,
             scale_strides);
-        quant_tensor_preprocessor->Execute(inputBufferRegions, outputBufferRegions);
+        quant_tensor_preprocessor.Execute(inputBufferRegions, outputBufferRegions);
 
         // Copy the temporary tensors back to the original tensor
         s_directml_context->execution_context->CopyBufferRegion(

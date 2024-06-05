@@ -11,7 +11,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-class DmlQuantTensorPreprocessor : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IUnknown>
+class DmlQuantTensorPreprocessor
 {
 public:
     DmlQuantTensorPreprocessor(

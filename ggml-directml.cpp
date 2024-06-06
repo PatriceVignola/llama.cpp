@@ -423,7 +423,7 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
             THROW_HR(E_NOTIMPL);
         }
 
-        const uint32_t num_quantized_elements = std::accumulate(tensor->ne, tensor->ne + GGML_MAX_DIMS, 1LL, std::multiplies<int64_t>());
+        const uint32_t num_quantized_elements = static_cast<uint32_t>(std::accumulate(tensor->ne, tensor->ne + GGML_MAX_DIMS, 1LL, std::multiplies<int64_t>()));
 
         auto preprocess = [num_quantized_elements, block_size, packed_element_count](byte* uploadHeapData, const uint8_t* srcData) {
             const uint32_t num_blocks = num_quantized_elements / block_size;
@@ -432,7 +432,7 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
             auto dst_bytes = reinterpret_cast<int8_t*>(uploadHeapData);
             auto src_bytes = reinterpret_cast<const int8_t*>(srcData);
 
-            for (int block_index = 0; block_index < num_blocks; ++block_index) {
+            for (uint32_t block_index = 0; block_index < num_blocks; ++block_index) {
                 memcpy(dst_bytes + preprocessed_scale_index, src_bytes, sizeof(ggml_fp16_t));
                 src_bytes += sizeof(ggml_fp16_t);
                 preprocessed_scale_index += sizeof(ggml_fp16_t);//
@@ -1269,10 +1269,60 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
             case GGML_OP_MUL_MAT:
                 {
                     if (node->src[0]->type == GGML_TYPE_Q6_K) {
-                        // TODO (pavignol): Cache the ops
                         // TODO (pavignol): Create scratch memory for the dequantized output in the preprocessing phase
-                        auto dequantize_op = create_dequantize_int6(node->src[0]->ne[0] * node->src[0]->ne[1], ggml_to_dml_datatype(node->type));
-                        THROW_HR(E_NOTIMPL);
+
+                        auto node_key = make_node_key(node);
+                        auto dml_ops = find_operators(node_key);
+
+                        if (dml_ops.empty()) {
+                            uint32_t k = static_cast<uint32_t>(node->src[0]->ne[0] * node->src[0]->ne[1]);
+                            auto dequantize_op = create_dequantize_int6(k, ggml_to_dml_datatype(node->type));
+                            auto matmul_op = create_matmul(scope, node_inputs, dml_output_desc);
+                            auto cache_matmul_op = std::make_unique<DmlGraphOperator>(scope, matmul_op, s_directml_context->execution_context.get(), *s_directml_context->allocator);
+
+                            dml_ops = {dequantize_op.get(), cache_matmul_op.get()};
+                            std::vector<std::unique_ptr<DmlOperator>> cache_dml_ops;
+                            cache_dml_ops.push_back(std::move(dequantize_op));
+                            cache_dml_ops.push_back(std::move(cache_matmul_op));
+                            cache_operators(std::move(node_key), std::move(cache_dml_ops));
+                        }
+
+                        const auto dequantized_tensor_sizes = ggml_to_dml_sizes(node->src[0]);
+                        const auto dequantized_data_type = ggml_to_dml_datatype(node->type);
+                        const auto dequantized_tensor_desc = dml::TensorDesc(dequantized_data_type, dequantized_tensor_sizes);
+
+                        ComPtr<ID3D12Resource> temp_resource;
+                        auto temp_buffer = CD3DX12_RESOURCE_DESC::Buffer(dequantized_tensor_desc.totalTensorSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+                        auto heap_props = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+                        THROW_IF_FAILED(s_directml_context->d3d12_device->CreateCommittedResource(
+                            &heap_props,
+                            D3D12_HEAP_FLAG_NONE,
+                            &temp_buffer,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            nullptr,
+                            IID_PPV_ARGS(temp_resource.GetAddressOf())
+                        ));
+
+                        // TODO (pavignol): Use pooled resources to avoid recreating them for every iteration
+                        s_directml_context->execution_context->QueueReference(temp_resource.Get());
+                        auto temp_buffer_region = Dml::D3D12BufferRegion(0, dequantized_tensor_desc.totalTensorSizeInBytes, temp_resource.Get());
+
+                        dml_operators.push_back(dml_ops[0]);
+                        operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                            s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
+                        });
+                        operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                            temp_buffer_region,
+                        }));
+
+                        dml_operators.push_back(dml_ops[1]);
+                        operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                            temp_buffer_region,
+                            s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes),
+                        });
+                        operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                            s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
+                        }));
                     } else if (ggml_is_quantized(node->src[0]->type)) {
                         auto node_key = make_node_key(node);
                         auto dml_op = find_operator(node_key);

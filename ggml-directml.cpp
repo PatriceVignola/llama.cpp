@@ -297,7 +297,7 @@ struct ggml_directml_context {
     Dml::DmlCommandRecorder* current_recorder = nullptr;
 
     // TODO (pavignol): Convert to an hash map
-    std::vector<std::pair<NodeKey, std::unique_ptr<DmlOperator>>> operator_cache;
+    std::vector<std::pair<NodeKey, std::vector<std::unique_ptr<DmlOperator>>>> operator_cache;
 
     ggml_directml_context(int device)
         : device(device)
@@ -1165,14 +1165,37 @@ static float fp16_to_fp32(ggml_fp16_t value) {
     return static_cast<float>(GGML_COMPUTE_FP16_TO_FP32(value));
 }
 
-static DmlOperator* find_operator(const NodeKey& new_node_key) {
-    for (const auto& old_op : s_directml_context->operator_cache) {
-        if (new_node_key == old_op.first) {
-            return old_op.second.get();
+static std::vector<DmlOperator*> find_operators(const NodeKey& new_node_key) {
+    for (const auto& old_ops : s_directml_context->operator_cache) {
+        if (new_node_key == old_ops.first) {
+            std::vector<DmlOperator*> old_op_pointers;
+            old_op_pointers.reserve(old_ops.second.size());
+
+            for (const auto& old_op : old_ops.second) {
+                old_op_pointers.push_back(old_op.get());
+            }
+
+            return old_op_pointers;
         }
     }
 
-    return nullptr;
+    return {};
+}
+
+static DmlOperator* find_operator(const NodeKey& new_node_key) {
+    auto operators = find_operators(new_node_key);
+    assert(operators.size() < 2);
+    return operators.empty() ? nullptr : operators[0];
+}
+
+static void cache_operator(NodeKey&& node_key, std::unique_ptr<DmlOperator>&& cache_dml_op) {
+    std::vector<std::unique_ptr<DmlOperator>> operators;
+    operators.push_back(std::move(cache_dml_op));
+    s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(operators));
+}
+
+static void cache_operators(NodeKey&& node_key, std::vector<std::unique_ptr<DmlOperator>>&& cache_dml_ops) {
+    s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_ops));
 }
 
 static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -1231,7 +1254,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         auto result = create_rmsnorm(scope, node_inputs, dml_output_desc, epsilon);
                         auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
                         dml_op = cache_dml_op.get();
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
+                        cache_operator(std::move(node_key), std::move(cache_dml_op));
                     }
 
                     dml_operators.push_back(dml_op);
@@ -1269,7 +1292,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                             auto result = create_quantized_matmul(scope, node_inputs, dml_output_desc, quantization_type);
                             auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
                             dml_op = cache_dml_op.get();
-                            s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
+                            cache_operator(std::move(node_key), std::move(cache_dml_op));
                         }
 
                         dml_operators.push_back(dml_op);
@@ -1304,7 +1327,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                             auto result = create_matmul(scope, node_inputs, dml_output_desc);
                             auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
                             dml_op = cache_dml_op.get();
-                            s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
+                            cache_operator(std::move(node_key), std::move(cache_dml_op));
                         }
 
                         dml_operators.push_back(dml_op);
@@ -1327,7 +1350,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         auto result = create_multiply(scope, node_inputs, dml_output_desc);
                         auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
                         dml_op = cache_dml_op.get();
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
+                        cache_operator(std::move(node_key), std::move(cache_dml_op));
                     }
 
                     dml_operators.push_back(dml_op);
@@ -1366,7 +1389,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 
                         auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
                         dml_op = cache_dml_op.get();
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
+                        cache_operator(std::move(node_key), std::move(cache_dml_op));
                     }
 
                     dml_operators.push_back(dml_op);
@@ -1388,7 +1411,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     if (!dml_op) {
                         auto cache_dml_op = create_copy(scope, node_inputs, dml_output_desc);
                         dml_op = cache_dml_op.get();
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
+                        cache_operator(std::move(node_key), std::move(cache_dml_op));
                     }
 
                     dml_operators.push_back(dml_op);
@@ -1413,7 +1436,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         auto result = create_softmax(scope, node_inputs, dml_output_desc, scale, max_bias);
                         auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
                         dml_op = cache_dml_op.get();
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
+                        cache_operator(std::move(node_key), std::move(cache_dml_op));
                     }
 
                     dml_operators.push_back(dml_op);
@@ -1441,7 +1464,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         auto result = create_add(scope, node_inputs, dml_output_desc);
                         auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
                         dml_op = cache_dml_op.get();
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
+                        cache_operator(std::move(node_key), std::move(cache_dml_op));
                     }
 
                     dml_operators.push_back(dml_op);
@@ -1503,7 +1526,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 
                         auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
                         dml_op = cache_dml_op.get();
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
+                        cache_operator(std::move(node_key), std::move(cache_dml_op));
                     }
 
                     dml_operators.push_back(dml_op);

@@ -1302,7 +1302,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         scale_tensor_sizes.back() /= get_quant_block_size(node->src[0]->type);
 
                         const auto quantized_data_type = ggml_to_dml_datatype(node->src[0]->type);
-                        auto quantized_tensor_desc = dml::TensorDesc(DML_TENSOR_DATA_TYPE_INT8, quantized_tensor_sizes);
+                        auto quantized_tensor_desc = dml::TensorDesc(quantized_data_type, quantized_tensor_sizes);
                         auto scale_tensor_desc = dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT16, scale_tensor_sizes);
 
                         auto quantized_buffer_region = s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, quantized_tensor_desc.totalTensorSizeInBytes);

@@ -1274,10 +1274,19 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         auto node_key = make_node_key(node);
                         auto dml_ops = find_operators(node_key);
 
+                        const auto dequantized_tensor_sizes = ggml_to_dml_sizes(node->src[0]);
+                        const auto dequantized_data_type = ggml_to_dml_datatype(node->type);
+                        const auto dequantized_tensor_desc = dml::TensorDesc(dequantized_data_type, dequantized_tensor_sizes);
+
                         if (dml_ops.empty()) {
                             uint32_t k = static_cast<uint32_t>(node->src[0]->ne[0] * node->src[0]->ne[1]);
                             auto dequantize_op = create_dequantize_int6(k, ggml_to_dml_datatype(node->type));
-                            auto matmul_op = create_matmul(scope, node_inputs, dml_output_desc);
+
+                            std::vector<dml::Expression> matmul_inputs = {
+                                dml::InputTensor(scope, 0, dequantized_tensor_desc),
+                                dml::InputTensor(scope, 1, ggml_to_dml_tensor_desc(node->src[1])),
+                            };
+                            auto matmul_op = create_matmul(scope, matmul_inputs, dml_output_desc);
                             auto cache_matmul_op = std::make_unique<DmlGraphOperator>(scope, matmul_op, s_directml_context->execution_context.get(), *s_directml_context->allocator);
 
                             dml_ops = {dequantize_op.get(), cache_matmul_op.get()};
@@ -1286,10 +1295,6 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                             cache_dml_ops.push_back(std::move(cache_matmul_op));
                             cache_operators(std::move(node_key), std::move(cache_dml_ops));
                         }
-
-                        const auto dequantized_tensor_sizes = ggml_to_dml_sizes(node->src[0]);
-                        const auto dequantized_data_type = ggml_to_dml_datatype(node->type);
-                        const auto dequantized_tensor_desc = dml::TensorDesc(dequantized_data_type, dequantized_tensor_sizes);
 
                         ComPtr<ID3D12Resource> temp_resource;
                         auto temp_buffer = CD3DX12_RESOURCE_DESC::Buffer(dequantized_tensor_desc.totalTensorSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -1309,16 +1314,20 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 
                         dml_operators.push_back(dml_ops[0]);
                         operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
-                            s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
+                            s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, node->src[0]->nb[GGML_MAX_DIMS - 1]),
                         });
                         operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
                             temp_buffer_region,
                         }));
 
                         dml_operators.push_back(dml_ops[1]);
+
+                        // When a dmlx graph has a single operator, it gets rid of the graph and executes the operator itself. Since GEMM always has 3 inputs
+                        // (the C tensor is optional but always has a bind point), we need to add an empty buffer region here.
                         operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
                             temp_buffer_region,
                             s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes),
+                            Dml::D3D12BufferRegion(),
                         });
                         operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
                             s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),

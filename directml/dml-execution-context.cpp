@@ -206,6 +206,32 @@ namespace Dml
             constants, total_element_count, constant_count);
     }
 
+    void ExecutionContext::ExecuteCustomOperatorByGroup(
+        ID3D12RootSignature* root_signature,
+        ID3D12PipelineState* pipeline_state,
+        const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
+        const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
+        const void* constants,
+        uint32_t constant_count,
+        uint32_t groupCountX,
+        uint32_t groupCountY,
+        uint32_t groupCountZ)
+    {
+        assert(!m_closed);
+        SetCommandRecorder(&m_dmlRecorder);
+
+        m_dmlRecorder.ExecuteCustomOperatorByGroup(
+            root_signature,
+            pipeline_state,
+            input_buffer_regions,
+            output_buffer_regions,
+            constants,
+            constant_count,
+            groupCountX,
+            groupCountY,
+            groupCountZ);
+    }
+
     void ExecutionContext::AddUAVBarrier()
     {
         assert(!m_closed);

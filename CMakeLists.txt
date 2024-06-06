@@ -810,6 +810,8 @@ if (LLAMA_DIRECTML)
         directml/dml-command-recorder.h
         directml/dml-copy-operator.cpp
         directml/dml-copy-operator.h
+        directml/dml-dequantize-int6.cpp
+        directml/dml-dequantize-int6.h
         directml/dml-descriptor-pool.cpp
         directml/dml-descriptor-pool.h
         directml/dml-execution-context.cpp
@@ -824,6 +826,8 @@ if (LLAMA_DIRECTML)
         directml/dml-operator.h
         directml/dml-pooled-upload-heap.cpp
         directml/dml-pooled-upload-heap.h
+        directml/dml-quantized-gemm-int6.cpp
+        directml/dml-quantized-gemm-int6.h
         directml/dml-readback-heap.cpp
         directml/dml-readback-heap.h
         directml/dml-reserved-resource-allocator-wrapper.h

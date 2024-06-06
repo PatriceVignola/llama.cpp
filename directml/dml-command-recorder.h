@@ -51,6 +51,17 @@ namespace Dml
             uint32_t total_element_count,
             uint32_t constant_count);
 
+        void ExecuteCustomOperatorByGroup(
+            ID3D12RootSignature* root_signature,
+            ID3D12PipelineState* pipeline_state,
+            const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
+            const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
+            const void* constants,
+            uint32_t constant_count,
+            uint32_t groupCountX,
+            uint32_t groupCountY,
+            uint32_t groupCountZ);
+
         void CopyBufferRegion(
             ID3D12Resource* dstBuffer,
             uint64_t dstOffset,

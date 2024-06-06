@@ -32,6 +32,8 @@
 #include "directml/dml-readback-heap.h"
 #include "directml/dml-managed-buffer.h"
 #include "directml/dml-copy-operator.h"
+#include "directml/dml-quantized-gemm-int6.h"
+#include "directml/dml-dequantize-int6.h"
 #include "directml/dml-operator.h"
 #include "directml/dml-graph-operator.h"
 
@@ -706,6 +708,14 @@ static dml::Expression create_quantized_matmul(
     return result;
 }
 
+static std::unique_ptr<DmlDequantizeInt6Operator> create_dequantize_int6(uint32_t k, DML_TENSOR_DATA_TYPE output_data_type) {
+    return std::make_unique<DmlDequantizeInt6Operator>(
+        s_directml_context->d3d12_device.Get(),
+        s_directml_context->execution_context.get(),
+        k,
+        output_data_type);
+}
+
 static dml::Expression create_rmsnorm(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc, float epsilon) {
     GGML_ASSERT(node_inputs.size() == 1);
 
@@ -1167,8 +1177,8 @@ static DmlOperator* find_operator(const NodeKey& new_node_key) {
 
 static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     std::unordered_map<ggml_tensor*, dml::Expression> nodes;
-    std::vector<std::vector<ggml_tensor*>> operator_inputs;
-    std::vector<std::vector<ggml_tensor*>> operator_outputs;
+    std::vector<std::vector<Dml::D3D12BufferRegion>> operator_inputs;
+    std::vector<std::vector<Dml::D3D12BufferRegion>> operator_outputs;
     std::vector<DmlOperator*> dml_operators;
 
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
@@ -1185,10 +1195,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                 break;
             }
 
-            if (node->src[src_index]->type == GGML_TYPE_Q6_K) {
-                // TODO (pavignol): Implement me
-                THROW_HR(E_NOTIMPL);
-            } else if (ggml_is_quantized(node->src[src_index]->type)) {
+            if (ggml_is_quantized(node->src[src_index]->type)) {
+                if (node->src[src_index]->type == GGML_TYPE_Q6_K) {
+                    continue;
+                }
+
                 auto quantized_tensor_sizes = ggml_to_dml_sizes(node->src[src_index]);
                 auto scale_tensor_sizes = quantized_tensor_sizes;
                 scale_tensor_sizes.back() /= get_quant_block_size(node->src[src_index]->type);
@@ -1206,7 +1217,6 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         }
 
         auto dml_output_desc = ggml_to_dml_tensor_desc(node);
-        bool is_no_op = false;
         scope.PushName(node->name);
 
         switch (node->op) {
@@ -1225,17 +1235,26 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     }
 
                     dml_operators.push_back(dml_op);
+                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                        s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
+                    });
+                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                        s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
+                    }));
                 }
                 break;
             case GGML_OP_MUL_MAT:
                 {
-                    auto node_key = make_node_key(node);
-                    auto dml_op = find_operator(node_key);
+                    if (node->src[0]->type == GGML_TYPE_Q6_K) {
+                        // TODO (pavignol): Cache the ops
+                        // TODO (pavignol): Create scratch memory for the dequantized output in the preprocessing phase
+                        auto dequantize_op = create_dequantize_int6(node->src[0]->ne[0] * node->src[0]->ne[1], ggml_to_dml_datatype(node->type));
+                        THROW_HR(E_NOTIMPL);
+                    } else if (ggml_is_quantized(node->src[0]->type)) {
+                        auto node_key = make_node_key(node);
+                        auto dml_op = find_operator(node_key);
 
-                    if (!dml_op) {
-                        dml::Expression result;
-
-                        if (ggml_is_quantized(node->src[0]->type)) {
+                        if (!dml_op) {
                             DML_QUANTIZATION_TYPE quantization_type;
 
                             switch (node->src[0]->type) {
@@ -1247,17 +1266,56 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                                 THROW_HR(E_NOTIMPL);
                             }
 
-                            result = create_quantized_matmul(scope, node_inputs, dml_output_desc, quantization_type);
-                        } else {
-                            result = create_matmul(scope, node_inputs, dml_output_desc);
+                            auto result = create_quantized_matmul(scope, node_inputs, dml_output_desc, quantization_type);
+                            auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
+                            dml_op = cache_dml_op.get();
+                            s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
                         }
 
-                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
-                        dml_op = cache_dml_op.get();
-                        s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
-                    }
+                        dml_operators.push_back(dml_op);
 
-                    dml_operators.push_back(dml_op);
+                        auto quantized_tensor_sizes = ggml_to_dml_sizes(node->src[0]);
+                        auto scale_tensor_sizes = quantized_tensor_sizes;
+                        scale_tensor_sizes.back() /= get_quant_block_size(node->src[0]->type);
+
+                        const auto quantized_data_type = ggml_to_dml_datatype(node->src[0]->type);
+                        auto quantized_tensor_desc = dml::TensorDesc(DML_TENSOR_DATA_TYPE_INT8, quantized_tensor_sizes);
+                        auto scale_tensor_desc = dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT16, scale_tensor_sizes);
+
+                        auto quantized_buffer_region = s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, quantized_tensor_desc.totalTensorSizeInBytes);
+                        auto scale_buffer_region = Dml::D3D12BufferRegion(quantized_buffer_region.Offset() + quantized_tensor_desc.totalTensorSizeInBytes, scale_tensor_desc.totalTensorSizeInBytes, quantized_buffer_region.GetD3D12Resource());
+
+                        std::vector<Dml::D3D12BufferRegion> inputBufferRegions;
+                        inputBufferRegions.push_back(std::move(quantized_buffer_region));
+                        inputBufferRegions.push_back(std::move(scale_buffer_region));
+
+                        auto a_tensor_buffer_region = s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes);
+                        inputBufferRegions.push_back(std::move(a_tensor_buffer_region));
+
+                        operator_inputs.push_back(std::move(inputBufferRegions));
+                        operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                            s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
+                        }));
+                    } else {
+                        auto node_key = make_node_key(node);
+                        auto dml_op = find_operator(node_key);
+
+                        if (!dml_op) {
+                            auto result = create_matmul(scope, node_inputs, dml_output_desc);
+                            auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
+                            dml_op = cache_dml_op.get();
+                            s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_op));
+                        }
+
+                        dml_operators.push_back(dml_op);
+                        operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                            s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
+                            s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes),
+                        });
+                        operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                            s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
+                        }));
+                    }
                 }
                 break;
             case GGML_OP_MUL:
@@ -1273,6 +1331,13 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     }
 
                     dml_operators.push_back(dml_op);
+                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                        s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
+                        s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes),
+                    });
+                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                        s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
+                    }));
                 }
                 break;
             case GGML_OP_ROPE:
@@ -1305,6 +1370,13 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     }
 
                     dml_operators.push_back(dml_op);
+                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                        s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
+                        s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes),
+                    });
+                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                        s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
+                    }));
                 }
                 break;
             case GGML_OP_CPY:
@@ -1320,6 +1392,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     }
 
                     dml_operators.push_back(dml_op);
+                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                        s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
+                    });
+                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                        s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
+                    }));
                 }
                 break;
             case GGML_OP_SOFT_MAX:
@@ -1339,6 +1417,19 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     }
 
                     dml_operators.push_back(dml_op);
+                    std::vector<Dml::D3D12BufferRegion> ggml_input_tensors = {
+                        s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
+                    };
+
+                    if (node->src[1]) {
+                        auto input_buffer_region = s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes);
+                        ggml_input_tensors.push_back(input_buffer_region);
+                    }
+
+                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{std::move(ggml_input_tensors)});
+                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                        s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
+                    }));
                 }
                 break;
             case GGML_OP_ADD:
@@ -1354,6 +1445,13 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     }
 
                     dml_operators.push_back(dml_op);
+                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                        s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
+                        s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes),
+                    });
+                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                        s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
+                    }));
                 }
                 break;
             case GGML_OP_UNARY:
@@ -1409,6 +1507,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     }
 
                     dml_operators.push_back(dml_op);
+                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                        s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
+                    });
+                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                        s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
+                    }));
                 }
                 break;
             case GGML_OP_TRANSPOSE:
@@ -1417,62 +1521,16 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
             case GGML_OP_VIEW:
             case GGML_OP_NONE:
                 // Nothing to do here yet, but we may have to implement it if we move to a graph
-                is_no_op = true;
                 break;
             default:
                 THROW_HR(E_NOTIMPL);
         }
 
         scope.PopName();
-
-        if (!is_no_op) {
-            std::vector<ggml_tensor*> current_inputs;
-            for (int src_index = 0; src_index < node_inputs.size(); ++src_index) {
-                if (node->src[src_index]) {
-                    current_inputs.push_back(node->src[src_index]);
-                }
-            }
-
-            operator_inputs.push_back(std::move(current_inputs));
-            operator_outputs.push_back(std::vector<ggml_tensor*>({node}));
-        }
     }
 
     for (int operator_index = 0; operator_index < dml_operators.size(); ++operator_index) {
-        const std::vector<ggml_tensor*> current_operator_inputs = operator_inputs[operator_index];
-        const std::vector<ggml_tensor*> current_operator_outputs = operator_outputs[operator_index];
-
-        std::vector<Dml::D3D12BufferRegion> inputBufferRegions;
-        inputBufferRegions.reserve(current_operator_inputs.size());
-        for (const auto& operator_input : current_operator_inputs) {
-             if (ggml_is_quantized(operator_input->type)) {
-                auto quantized_tensor_sizes = ggml_to_dml_sizes(operator_input);
-                auto scale_tensor_sizes = quantized_tensor_sizes;
-                scale_tensor_sizes.back() /= get_quant_block_size(operator_input->type);
-
-                const auto quantized_data_type = ggml_to_dml_datatype(operator_input->type);
-                auto quantized_tensor_desc = dml::TensorDesc(DML_TENSOR_DATA_TYPE_INT8, quantized_tensor_sizes);
-                auto scale_tensor_desc = dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT16, scale_tensor_sizes);
-
-                auto quantized_buffer_region = s_directml_context->allocator->CreateBufferRegion(operator_input->data, quantized_tensor_desc.totalTensorSizeInBytes);
-                auto scale_buffer_region = Dml::D3D12BufferRegion(quantized_buffer_region.Offset() + quantized_tensor_desc.totalTensorSizeInBytes, scale_tensor_desc.totalTensorSizeInBytes, quantized_buffer_region.GetD3D12Resource());
-
-                inputBufferRegions.push_back(std::move(quantized_buffer_region));
-                inputBufferRegions.push_back(std::move(scale_buffer_region));
-            } else {
-                auto input_buffer_region = s_directml_context->allocator->CreateBufferRegion(operator_input->data, ggml_to_dml_tensor_desc(operator_input).totalTensorSizeInBytes);
-                inputBufferRegions.push_back(std::move(input_buffer_region));
-            }
-        }
-
-        std::vector<Dml::D3D12BufferRegion> outputBufferRegions;
-        outputBufferRegions.reserve(current_operator_outputs.size());
-        for (const auto& operator_output : current_operator_outputs) {
-            auto output_buffer_region = s_directml_context->allocator->CreateBufferRegion(operator_output->data, ggml_to_dml_tensor_desc(operator_output).totalTensorSizeInBytes);
-            outputBufferRegions.push_back(std::move(output_buffer_region));
-        }
-
-        dml_operators[operator_index]->Execute(inputBufferRegions, outputBufferRegions);
+        dml_operators[operator_index]->Execute(operator_inputs[operator_index], operator_outputs[operator_index]);
 
 /*
         std::vector<std::vector<uint8_t>> srcData(current_operator_inputs.size());

@@ -295,6 +295,56 @@ void DmlCommandRecorder::ExecuteCustomOperator(
     m_currentCommandList->ResourceBarrier(output_barriers.size(), output_barriers.data());
 }
 
+void DmlCommandRecorder::ExecuteCustomOperatorByGroup(
+    ID3D12RootSignature* root_signature,
+    ID3D12PipelineState* pipeline_state,
+    const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
+    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
+    const void* constants,
+    uint32_t constant_count,
+    uint32_t groupCountX,
+    uint32_t groupCountY,
+    uint32_t groupCountZ)
+{
+    DescriptorRange descriptorRange = m_descriptorPool.AllocDescriptors(
+        input_buffer_regions.size() + output_buffer_regions.size(),
+        m_queue->GetNextCompletionEvent());
+
+    // Set the root signature and pipeline state
+    m_currentCommandList->SetComputeRootSignature(root_signature);
+    m_currentCommandList->SetPipelineState(pipeline_state);
+
+    uint32_t uav_view_index = 0;
+    for (const auto& input_buffer_region : input_buffer_regions) {
+        m_currentCommandList->SetComputeRootUnorderedAccessView(uav_view_index++, input_buffer_region.GetD3D12Resource()->GetGPUVirtualAddress() + input_buffer_region.Offset());
+    }
+
+    for (const auto& output_buffer_region : output_buffer_regions) {
+        m_currentCommandList->SetComputeRootUnorderedAccessView(uav_view_index++, output_buffer_region.GetD3D12Resource()->GetGPUVirtualAddress() + output_buffer_region.Offset());
+    }
+
+    // Set root constants
+    m_currentCommandList->SetComputeRoot32BitConstants(
+        input_buffer_regions.size() + output_buffer_regions.size(), // root parameter index
+        constant_count, // Constant count
+        constants,
+        0 // offset
+    );
+
+    m_currentCommandList->Dispatch(groupCountX, groupCountY, groupCountZ);
+
+    // Record the execution work.
+    SetDescriptorHeap(descriptorRange.heap);
+    m_operationsRecordedInCurrentCommandList = true;
+
+    // Barrier all outputs.
+    std::vector<D3D12_RESOURCE_BARRIER> output_barriers(output_buffer_regions.size());
+    for (int i = 0; i < output_buffer_regions.size(); ++i) {
+        output_barriers[i] = CD3DX12_RESOURCE_BARRIER::UAV(output_buffer_regions[i].GetD3D12Resource());
+    }
+    m_currentCommandList->ResourceBarrier(output_barriers.size(), output_barriers.data());
+}
+
 void DmlCommandRecorder::CopyBufferRegion(
     ID3D12Resource* dstBuffer,
     uint64_t dstOffset,

@@ -405,43 +405,65 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
     const auto dstState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; // GPU resources are always kept in UAV state
 
     if (ggml_is_quantized(tensor->type) && tensor->type != GGML_TYPE_Q6_K) {
-        uint32_t block_size;
-        uint32_t packed_element_count;
+        const uint32_t num_quantized_elements = static_cast<uint32_t>(std::accumulate(tensor->ne, tensor->ne + GGML_MAX_DIMS, 1LL, std::multiplies<int64_t>()));
+
+        std::function<void(byte*, const uint8_t*)> preprocess;
 
         switch (tensor->type) {
-        case GGML_TYPE_Q8_0:
-            block_size = QK8_0;
-            packed_element_count = 1;
-            break;
+        case GGML_TYPE_Q8_0: {
+            preprocess = [num_quantized_elements](byte* uploadHeapData, const uint8_t* srcData) {
+                constexpr uint32_t block_size = QK8_0;
+                const uint32_t num_blocks = num_quantized_elements / block_size;
+                uint32_t preprocessed_quantized_index = 0;
+                uint32_t preprocessed_scale_index = num_quantized_elements * sizeof(int8_t);
+                auto dst_bytes = reinterpret_cast<int8_t*>(uploadHeapData);
+                auto src_bytes = reinterpret_cast<const int8_t*>(srcData);
 
-        case GGML_TYPE_Q4_0:
-            block_size = QK4_0;
-            packed_element_count = 2;
+                for (uint32_t block_index = 0; block_index < num_blocks; ++block_index) {
+                    memcpy(dst_bytes + preprocessed_scale_index, src_bytes, sizeof(ggml_fp16_t));
+                    src_bytes += sizeof(ggml_fp16_t);
+                    preprocessed_scale_index += sizeof(ggml_fp16_t);
+
+                    memcpy(dst_bytes + preprocessed_quantized_index, src_bytes, block_size * sizeof(int8_t));
+                    src_bytes += block_size * sizeof(int8_t);
+                    preprocessed_quantized_index += block_size * sizeof(int8_t);
+                }
+            };
             break;
+        }
+
+        case GGML_TYPE_Q4_0: {
+            preprocess = [num_quantized_elements](byte* uploadHeapData, const uint8_t* srcData) {
+                constexpr uint32_t block_size = QK4_0;
+                constexpr uint32_t packed_element_count = 2;
+                const uint32_t num_blocks = num_quantized_elements / block_size;
+                uint32_t preprocessed_quantized_index = 0;
+                uint32_t preprocessed_scale_index = num_quantized_elements * sizeof(int8_t) / packed_element_count;
+                auto dst_bytes = reinterpret_cast<int8_t*>(uploadHeapData);
+                auto src_bytes = reinterpret_cast<const int8_t*>(srcData);
+
+                for (uint32_t block_index = 0; block_index < num_blocks; ++block_index) {
+                    memcpy(dst_bytes + preprocessed_scale_index, src_bytes, sizeof(ggml_fp16_t));
+                    src_bytes += sizeof(ggml_fp16_t);
+                    preprocessed_scale_index += sizeof(ggml_fp16_t);
+
+                    // The Q4_0 format is interleaved (first half of the block contains the lower 4 bits and the second half
+                    // contains the upper 4 bits), but DirectML expects it to be packed
+                    for (int i = 0; i < QK4_0 / 4; ++i) {
+                        dst_bytes[preprocessed_quantized_index + i] = (src_bytes[i * 2] & 0xF) | (src_bytes[i * 2 + 1] << 4);
+                        dst_bytes[preprocessed_quantized_index + i + (QK4_0 / 4)] = ((src_bytes[i * 2] >> 4) & 0xF) | (src_bytes[i * 2 + 1] & 0xF0);
+                    }
+
+                    src_bytes += block_size * sizeof(int8_t) / packed_element_count;
+                    preprocessed_quantized_index += block_size * sizeof(int8_t) / packed_element_count;
+                }
+            };
+            break;
+        }
 
         default:
             THROW_HR(E_NOTIMPL);
         }
-
-        const uint32_t num_quantized_elements = static_cast<uint32_t>(std::accumulate(tensor->ne, tensor->ne + GGML_MAX_DIMS, 1LL, std::multiplies<int64_t>()));
-
-        auto preprocess = [num_quantized_elements, block_size, packed_element_count](byte* uploadHeapData, const uint8_t* srcData) {
-            const uint32_t num_blocks = num_quantized_elements / block_size;
-            uint32_t preprocessed_quantized_index = 0;
-            uint32_t preprocessed_scale_index = num_quantized_elements * sizeof(int8_t) / packed_element_count;
-            auto dst_bytes = reinterpret_cast<int8_t*>(uploadHeapData);
-            auto src_bytes = reinterpret_cast<const int8_t*>(srcData);
-
-            for (uint32_t block_index = 0; block_index < num_blocks; ++block_index) {
-                memcpy(dst_bytes + preprocessed_scale_index, src_bytes, sizeof(ggml_fp16_t));
-                src_bytes += sizeof(ggml_fp16_t);
-                preprocessed_scale_index += sizeof(ggml_fp16_t);//
-
-                memcpy(dst_bytes + preprocessed_quantized_index, src_bytes, block_size * sizeof(int8_t) / packed_element_count);
-                src_bytes += block_size * sizeof(int8_t) / packed_element_count;
-                preprocessed_quantized_index += block_size * sizeof(int8_t) / packed_element_count;
-            }
-        };
 
         s_directml_context->upload_heap.BeginUploadToGpu(dstData, bufferRegion.Offset() + offset, dstState, reinterpret_cast<const uint8_t*>(srcData), size, preprocess);
     } else {

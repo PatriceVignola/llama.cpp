@@ -24,7 +24,10 @@ public:
         const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions) final;
 
 private:
-    struct Constants {};
+    // TODO (pavignol): Clean me up
+    struct Constants {
+        uint32_t abc;
+    };
 
     ComPtr<ID3D12Device> m_device;
     ComPtr<ID3D12RootSignature> m_rootSignature;

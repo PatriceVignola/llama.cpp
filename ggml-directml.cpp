@@ -404,36 +404,16 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
     ID3D12Resource* dstData = bufferRegion.GetD3D12Resource();
     const auto dstState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; // GPU resources are always kept in UAV state
 
-    if (ggml_is_quantized(tensor->type) && tensor->type != GGML_TYPE_Q6_K) {
-        const uint32_t num_quantized_elements = static_cast<uint32_t>(std::accumulate(tensor->ne, tensor->ne + GGML_MAX_DIMS, 1LL, std::multiplies<int64_t>()));
-
+    if (ggml_is_quantized(tensor->type)) {
         std::function<void(byte*, const uint8_t*)> preprocess;
 
         switch (tensor->type) {
-        case GGML_TYPE_Q8_0: {
-            preprocess = [num_quantized_elements](byte* uploadHeapData, const uint8_t* srcData) {
-                constexpr uint32_t block_size = QK8_0;
-                const uint32_t num_blocks = num_quantized_elements / block_size;
-                uint32_t preprocessed_quantized_index = 0;
-                uint32_t preprocessed_scale_index = num_quantized_elements * sizeof(int8_t);
-                auto dst_bytes = reinterpret_cast<int8_t*>(uploadHeapData);
-                auto src_bytes = reinterpret_cast<const int8_t*>(srcData);
-
-                for (uint32_t block_index = 0; block_index < num_blocks; ++block_index) {
-                    memcpy(dst_bytes + preprocessed_scale_index, src_bytes, sizeof(ggml_fp16_t));
-                    src_bytes += sizeof(ggml_fp16_t);
-                    preprocessed_scale_index += sizeof(ggml_fp16_t);
-
-                    memcpy(dst_bytes + preprocessed_quantized_index, src_bytes, block_size * sizeof(int8_t));
-                    src_bytes += block_size * sizeof(int8_t);
-                    preprocessed_quantized_index += block_size * sizeof(int8_t);
-                }
-            };
-            break;
-        }
-
+        // The stored int4 weights in ggml are "interleaved" in a block: the first 16 bytes of the block contain the lower 4 bits of all the weights,
+        // and the last 16 bytes of the block contain the upper 4 bits of all the weights. Also, DML requires the quantization parameters to be stored
+        // in a different buffer, so we put all the scales at the end of the memory.
         case GGML_TYPE_Q4_0: {
-            preprocess = [num_quantized_elements](byte* uploadHeapData, const uint8_t* srcData) {
+            preprocess = [tensor](byte* uploadHeapData, const uint8_t* srcData) {
+                const uint32_t num_quantized_elements = static_cast<uint32_t>(std::accumulate(tensor->ne, tensor->ne + GGML_MAX_DIMS, 1LL, std::multiplies<int64_t>()));
                 constexpr uint32_t block_size = QK4_0;
                 constexpr uint32_t packed_element_count = 2;
                 const uint32_t num_blocks = num_quantized_elements / block_size;
@@ -456,6 +436,57 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
 
                     src_bytes += block_size * sizeof(int8_t) / packed_element_count;
                     preprocessed_quantized_index += block_size * sizeof(int8_t) / packed_element_count;
+                }
+            };
+            break;
+        }
+
+        // The block_q6_K struct contains 210 bytes, but unfortunately HLSL pads structs to 4-byte boundaries. This means that in order
+        // to use the struct as-is in HLSL, we need to extract the float16 super-block scale out of it and put it in another view. To do
+        // this, we preprocess it here by tightly packing the non-scale structures (208 bytes) one after the other, and moving all the
+        // super-block scales at the end.
+        case GGML_TYPE_Q6_K: {
+            preprocess = [tensor](byte* uploadHeapData, const uint8_t* srcData) {
+                constexpr uint32_t block_size = sizeof(block_q6_K);
+                constexpr uint32_t block_size_without_scale = block_size - sizeof(ggml_fp16_t);
+                const uint32_t num_blocks = tensor->nb[GGML_MAX_DIMS - 1] / block_size;
+                uint32_t preprocessed_quantized_index = 0;
+                uint32_t preprocessed_scale_index = num_blocks * block_size_without_scale;
+                auto dst_bytes = reinterpret_cast<uint8_t*>(uploadHeapData);
+                auto src_bytes = reinterpret_cast<const uint8_t*>(srcData);
+
+                for (uint32_t block_index = 0; block_index < num_blocks; ++block_index) {
+                    memcpy(dst_bytes + preprocessed_quantized_index, src_bytes, block_size_without_scale);
+                    src_bytes += block_size_without_scale;
+                    preprocessed_quantized_index += block_size_without_scale;
+
+                    memcpy(dst_bytes + preprocessed_scale_index, src_bytes, sizeof(ggml_fp16_t));
+                    src_bytes += sizeof(ggml_fp16_t);
+                    preprocessed_scale_index += sizeof(ggml_fp16_t);
+                }
+            };
+            break;
+        }
+
+        // DML requires the quantization parameters to be stored in a different buffer, so we put all the scales at the end of the memory.
+        case GGML_TYPE_Q8_0: {
+            preprocess = [tensor](byte* uploadHeapData, const uint8_t* srcData) {
+                const uint32_t num_quantized_elements = static_cast<uint32_t>(std::accumulate(tensor->ne, tensor->ne + GGML_MAX_DIMS, 1LL, std::multiplies<int64_t>()));
+                constexpr uint32_t block_size = QK8_0;
+                const uint32_t num_blocks = num_quantized_elements / block_size;
+                uint32_t preprocessed_quantized_index = 0;
+                uint32_t preprocessed_scale_index = num_quantized_elements * sizeof(int8_t);
+                auto dst_bytes = reinterpret_cast<int8_t*>(uploadHeapData);
+                auto src_bytes = reinterpret_cast<const int8_t*>(srcData);
+
+                for (uint32_t block_index = 0; block_index < num_blocks; ++block_index) {
+                    memcpy(dst_bytes + preprocessed_scale_index, src_bytes, sizeof(ggml_fp16_t));
+                    src_bytes += sizeof(ggml_fp16_t);
+                    preprocessed_scale_index += sizeof(ggml_fp16_t);
+
+                    memcpy(dst_bytes + preprocessed_quantized_index, src_bytes, block_size * sizeof(int8_t));
+                    src_bytes += block_size * sizeof(int8_t);
+                    preprocessed_quantized_index += block_size * sizeof(int8_t);
                 }
             };
             break;
@@ -1291,8 +1322,6 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
             case GGML_OP_MUL_MAT:
                 {
                     if (node->src[0]->type == GGML_TYPE_Q6_K) {
-                        // TODO (pavignol): Create scratch memory for the dequantized output in the preprocessing phase
-
                         auto node_key = make_node_key(node);
                         auto dml_ops = find_operators(node_key);
 
@@ -1334,9 +1363,17 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         s_directml_context->execution_context->QueueReference(temp_resource.Get());
                         auto temp_buffer_region = Dml::D3D12BufferRegion(0, dequantized_tensor_desc.totalTensorSizeInBytes, temp_resource.Get());
 
+                        constexpr uint32_t block_size = sizeof(block_q6_K);
+                        constexpr uint32_t block_size_without_scale = block_size - sizeof(ggml_fp16_t);
+                        const uint32_t num_blocks = node->src[0]->nb[GGML_MAX_DIMS - 1] / block_size;
+
+                        auto quantized_buffer_region = s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, block_size_without_scale * num_blocks);
+                        auto scale_buffer_region = Dml::D3D12BufferRegion(quantized_buffer_region.Offset() + block_size_without_scale * num_blocks, sizeof(ggml_fp16_t) * num_blocks, quantized_buffer_region.GetD3D12Resource());
+
                         dml_operators.push_back(dml_ops[0]);
                         operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
-                            s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, node->src[0]->nb[GGML_MAX_DIMS - 1]),
+                            quantized_buffer_region,
+                            scale_buffer_region,
                         });
                         operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
                             temp_buffer_region,

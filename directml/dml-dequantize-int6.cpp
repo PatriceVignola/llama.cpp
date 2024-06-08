@@ -25,7 +25,7 @@ DmlDequantizeInt6Operator::DmlDequantizeInt6Operator(
     m_groupCount = k / QK_K;
 
     // Compute root signature.
-    const int uavCount = 2;
+    const int uavCount = 3;
     std::vector<CD3DX12_ROOT_PARAMETER1> rootParameters;
     rootParameters.resize(uavCount + 1);
 
@@ -34,6 +34,7 @@ DmlDequantizeInt6Operator::DmlDequantizeInt6Operator(
         rootParameters[i].InitAsUnorderedAccessView(i);
     }
 
+    // TODO (pavignol): Clean me up
     const int constantCount = 0;
     rootParameters[uavCount].InitAsConstants(constantCount, 0);
 

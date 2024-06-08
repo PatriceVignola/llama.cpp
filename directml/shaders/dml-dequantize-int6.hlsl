@@ -10,21 +10,24 @@
 #endif
 
 #define UnpackXbitsFromYbits(packed32Bit, index, X, Y) (((packed32Bit) << ((Y-X) - (index)*X)) >> (Y-X))
-#define LoadXbitsFromYbits(buf, index, X, Y) UnpackXbitsFromYbits(buf[index/(Y/X)], index%(Y/X), X, Y)
+#define LoadXbitsFromYbits(buf, index, X, Y) UnpackXbitsFromYbits(buf[(index)/(Y/X)], (index)%(Y/X), X, Y)
 #define Load8Bits(buf, index) LoadXbitsFromYbits(buf, index, 8, 32)
 
+// HLSL pads structs to 4-byte boundaries, so we cannot keep the super-block scale here since it would add up to 210 bytes
 struct PackedData {
     uint32_t ql[QK_K/8];     // quants, lower 4 bits
     uint32_t qh[QK_K/16];    // quants, upper 2 bits
     int32_t scales[QK_K/64]; // scales, quantized with 8 bits
-    float16_t d;             // super-block scale
 };
 
 RWStructuredBuffer<PackedData> input : register(u0);
-RWStructuredBuffer<TOUT> output : register(u1);
+RWStructuredBuffer<float16_t> scales : register(u1); // super-block scale
+RWStructuredBuffer<TOUT> output : register(u2);
 
+// TODO (pavignol): Clean me up
 cbuffer Constants
 {
+    uint abc;
 };
 
 [RootSignature(ROOT_SIG_DEF)]
@@ -32,7 +35,7 @@ cbuffer Constants
 void main(uint3 groupId : SV_GroupID, uint3 threadId : SV_GroupThreadId)
 {
     const PackedData packedValue = input[groupId.x];
-    const float d = packedValue.d;
+    const float d = scales[groupId.x];
 
 #if QK_K == 256
 

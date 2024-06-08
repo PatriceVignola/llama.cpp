@@ -221,6 +221,51 @@ static std::shared_ptr<Dml::DmlGpuAllocator> CreateAllocator(
     return allocator;
 }
 
+// From boost http://www.boost.org/doc/libs/1_35_0/doc/html/hash/combine.html
+template <class T>
+inline void hash_combine(size_t& seed, T const& v) {
+  seed ^= std::hash<T>()(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+}
+
+template <typename T>
+struct std::hash<std::array<T, GGML_MAX_DIMS>> {
+  std::size_t operator()(const std::array<T, GGML_MAX_DIMS>& container) const noexcept {
+    size_t seed = 0;
+
+    for (const T& element : container) {
+      hash_combine(seed, element);
+    }
+
+    return seed;
+  }
+};
+
+template <typename T>
+struct std::hash<std::array<T, GGML_MAX_OP_PARAMS / sizeof(int32_t)>> {
+  std::size_t operator()(const std::array<T, GGML_MAX_OP_PARAMS / sizeof(int32_t)>& container) const noexcept {
+    size_t seed = 0;
+
+    for (const T& element : container) {
+      hash_combine(seed, element);
+    }
+
+    return seed;
+  }
+};
+
+template <typename T>
+struct std::hash<std::vector<T>> {
+  std::size_t operator()(const std::vector<T>& container) const noexcept {
+    size_t seed = 0;
+
+    for (const T& element : container) {
+      hash_combine(seed, element);
+    }
+
+    return seed;
+  }
+};
+
 // TODO (pavignol): Investigate if we can create a graph plan instead
 // A node key uniquely identifies a node/operator based on the sizes, strides, and parameters of their inputs/outputs
 struct NodeKey {
@@ -229,7 +274,7 @@ struct NodeKey {
     ggml_type type;
     std::array<int64_t, GGML_MAX_DIMS> ne;
     std::array<int64_t, GGML_MAX_DIMS> nb;
-    int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+    std::array<int32_t, GGML_MAX_OP_PARAMS / sizeof(int32_t)> op_params;
 
     std::vector<std::array<int64_t, GGML_MAX_DIMS>> src_ne;
     std::vector<std::array<int64_t, GGML_MAX_DIMS>> src_nb;
@@ -241,7 +286,7 @@ struct NodeKey {
         if (type != other.type) return false;
         if (ne != other.ne) return false;
         if (nb != other.nb) return false;
-        if (memcmp(op_params, other.op_params, GGML_MAX_OP_PARAMS) != 0) return false;
+        if (op_params != other.op_params) return false;
         if (src_ne.size() != other.src_ne.size()) return false;
 
         for (int i = 0; i < src_ne.size(); ++i) {
@@ -254,6 +299,23 @@ struct NodeKey {
     }
 };
 
+template <>
+struct std::hash<NodeKey> {
+  std::size_t operator()(const NodeKey& node_key) const noexcept {
+    size_t seed = 0;
+    hash_combine(seed, node_key.op);
+    hash_combine(seed, node_key.backend);
+    hash_combine(seed, node_key.type);
+    hash_combine(seed, node_key.ne);
+    hash_combine(seed, node_key.nb);
+    hash_combine(seed, node_key.op_params);
+    hash_combine(seed, node_key.src_ne);
+    hash_combine(seed, node_key.src_nb);
+    hash_combine(seed, node_key.src_types);
+    return seed;
+  }
+};
+
 static NodeKey make_node_key(const ggml_tensor* node) {
     NodeKey node_key;
     node_key.op = node->op;
@@ -261,7 +323,7 @@ static NodeKey make_node_key(const ggml_tensor* node) {
     node_key.type = node->type;
     std::copy(std::begin(node->ne), std::end(node->ne), node_key.ne.begin());
     std::copy(std::begin(node->nb), std::end(node->nb), node_key.nb.begin());
-    memcpy(node_key.op_params, node->op_params, GGML_MAX_OP_PARAMS);
+    std::copy(std::begin(node->op_params), std::end(node->op_params), node_key.op_params.begin());
 
     node_key.src_ne.reserve(GGML_MAX_SRC);
     node_key.src_nb.reserve(GGML_MAX_SRC);
@@ -295,9 +357,7 @@ struct ggml_directml_context {
     std::shared_ptr<Dml::DmlGpuAllocator> allocator;
     Dml::ReadbackHeap readback_heap;
     Dml::DmlCommandRecorder* current_recorder = nullptr;
-
-    // TODO (pavignol): Convert to an hash map
-    std::vector<std::pair<NodeKey, std::vector<std::unique_ptr<DmlOperator>>>> operator_cache;
+    std::unordered_map<NodeKey, std::vector<std::unique_ptr<DmlOperator>>> operator_cache;
 
     ggml_directml_context(int device)
         : device(device)
@@ -1218,18 +1278,18 @@ static float fp16_to_fp32(ggml_fp16_t value) {
     return static_cast<float>(GGML_COMPUTE_FP16_TO_FP32(value));
 }
 
-static std::vector<DmlOperator*> find_operators(const NodeKey& new_node_key) {
-    for (const auto& old_ops : s_directml_context->operator_cache) {
-        if (new_node_key == old_ops.first) {
-            std::vector<DmlOperator*> old_op_pointers;
-            old_op_pointers.reserve(old_ops.second.size());
+static std::vector<DmlOperator*> find_operators(const NodeKey& node_key) {
+    auto iter = s_directml_context->operator_cache.find(node_key);
 
-            for (const auto& old_op : old_ops.second) {
-                old_op_pointers.push_back(old_op.get());
-            }
+    if (iter != s_directml_context->operator_cache.end()) {
+        std::vector<DmlOperator*> old_op_pointers;
+        old_op_pointers.reserve(iter->second.size());
 
-            return old_op_pointers;
+        for (const auto& old_op : iter->second) {
+            old_op_pointers.push_back(old_op.get());
         }
+
+        return old_op_pointers;
     }
 
     return {};
@@ -1244,11 +1304,11 @@ static DmlOperator* find_operator(const NodeKey& new_node_key) {
 static void cache_operator(NodeKey&& node_key, std::unique_ptr<DmlOperator>&& cache_dml_op) {
     std::vector<std::unique_ptr<DmlOperator>> operators;
     operators.push_back(std::move(cache_dml_op));
-    s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(operators));
+    s_directml_context->operator_cache.emplace(std::move(node_key), std::move(operators));
 }
 
 static void cache_operators(NodeKey&& node_key, std::vector<std::unique_ptr<DmlOperator>>&& cache_dml_ops) {
-    s_directml_context->operator_cache.emplace_back(std::move(node_key), std::move(cache_dml_ops));
+    s_directml_context->operator_cache.emplace(std::move(node_key), std::move(cache_dml_ops));
 }
 
 static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -1256,6 +1316,46 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
     std::vector<std::vector<Dml::D3D12BufferRegion>> operator_inputs;
     std::vector<std::vector<Dml::D3D12BufferRegion>> operator_outputs;
     std::vector<DmlOperator*> dml_operators;
+
+//     bool reuse_command_list = true;
+// 
+//     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
+//         if (!reuse_command_list) {
+//             break;
+//         }
+// 
+//         auto node = cgraph->nodes[node_index];
+// 
+//         switch (node->op) {
+//             case GGML_OP_RMS_NORM:
+//             case GGML_OP_MUL_MAT:
+//             case GGML_OP_MUL:
+//             case GGML_OP_ROPE:
+//             case GGML_OP_CPY:
+//             case GGML_OP_CONT:
+//             case GGML_OP_SOFT_MAX:
+//             case GGML_OP_ADD:
+//             case GGML_OP_UNARY:
+//                 {
+//                     auto node_key = make_node_key(node);
+//                     if (s_directml_context->operator_cache.find(node_key) == s_directml_context->operator_cache.end()) {
+//                         reuse_command_list = false;
+//                     }
+//                 }
+//                 break;
+//             case GGML_OP_TRANSPOSE:
+//             case GGML_OP_PERMUTE:
+//             case GGML_OP_RESHAPE:
+//             case GGML_OP_VIEW:
+//             case GGML_OP_NONE:
+//                 // Nothing to do here yet, but we may have to implement it if we move to a graph
+//                 break;
+//             default:
+//                 THROW_HR(E_NOTIMPL);
+//         }
+//     }
+// 
+//     printf("Reuse command list: %d\n", reuse_command_list);
 
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         auto node = cgraph->nodes[node_index];

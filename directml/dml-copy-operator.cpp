@@ -65,6 +65,13 @@ DmlCopyOperator::DmlCopyOperator(
     CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC desc;
     desc.Init_1_1(static_cast<uint32_t>(rootParameters.size()), rootParameters.data());
 
+    // Create the descriptor heap
+    D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap_desc = {};
+    descriptor_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    descriptor_heap_desc.NumDescriptors = uavCount;
+    descriptor_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    THROW_IF_FAILED(d3d12Device->CreateDescriptorHeap(&descriptor_heap_desc, IID_PPV_ARGS(m_heap.ReleaseAndGetAddressOf())));
+
     ComPtr<ID3DBlob> rootSignatureBlob;
     ComPtr<ID3DBlob> rootSignatureErrorBlob;
     THROW_IF_FAILED(D3D12SerializeVersionedRootSignature(
@@ -102,14 +109,17 @@ DmlCopyOperator::DmlCopyOperator(
     THROW_IF_FAILED(m_device->CreateComputePipelineState(&computePsoDesc, IID_ID3D12PipelineState, &m_pipelineState));
 }
 
-void DmlCopyOperator::Execute(
+void DmlCopyOperator::RecordDispatch(
+    ID3D12GraphicsCommandList* command_list,
     const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
     const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions)
 {
     // Execute the operator
-    m_executionContext->ExecuteCustomOperator(
+    Dml::DmlCommandRecorder::RecordCustomOperatorDispatch(
+        command_list,
         m_rootSignature.Get(),
         m_pipelineState.Get(),
+        m_heap.Get(),
         input_buffer_regions,
         output_buffer_regions,
         &m_constants,

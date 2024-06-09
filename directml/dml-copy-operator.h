@@ -19,7 +19,8 @@ public:
         const dml::TensorDesc& input_tensor_desc,
         const dml::TensorDesc& output_tensor_desc);
 
-    void Execute(
+    void RecordDispatch(
+        ID3D12GraphicsCommandList* command_list,
         const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
         const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions) final;
 
@@ -36,6 +37,7 @@ private:
     ComPtr<ID3D12Device> m_device;
     ComPtr<ID3D12RootSignature> m_rootSignature;
     ComPtr<ID3D12PipelineState> m_pipelineState;
+    ComPtr<ID3D12DescriptorHeap> m_heap;
     Constants m_constants;
     Dml::ExecutionContext* m_executionContext;
 };

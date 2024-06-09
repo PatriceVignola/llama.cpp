@@ -280,6 +280,11 @@ struct NodeKey {
     std::vector<std::array<int64_t, GGML_MAX_DIMS>> src_nb;
     std::vector<ggml_type> src_types;
 
+    // TODO (pavignol): Relax the requirement on this; it should be allowed to change without invalidating
+    // the command list
+    std::vector<void*> src_data;
+    void* dst_data;
+
     bool operator==(const NodeKey& other) const {
         if (backend != other.backend) return false;
         if (op != other.op) return false;
@@ -288,6 +293,8 @@ struct NodeKey {
         if (nb != other.nb) return false;
         if (op_params != other.op_params) return false;
         if (src_ne.size() != other.src_ne.size()) return false;
+        if (src_data != other.src_data) return false;
+        if (dst_data != other.dst_data) return false;
 
         for (int i = 0; i < src_ne.size(); ++i) {
             if (src_types[i] != other.src_types[i]) return false;
@@ -312,6 +319,8 @@ struct std::hash<NodeKey> {
     hash_combine(seed, node_key.src_ne);
     hash_combine(seed, node_key.src_nb);
     hash_combine(seed, node_key.src_types);
+    hash_combine(seed, node_key.src_data);
+    hash_combine(seed, node_key.dst_data);
     return seed;
   }
 };
@@ -334,18 +343,33 @@ static NodeKey make_node_key(const ggml_tensor* node) {
         }
 
         node_key.src_types.push_back(node->src[i]->type);
+        node_key.src_data.push_back(node->src[i]->data);
         node_key.src_ne.resize(i + 1);
         std::copy(std::begin(node->src[i]->ne), std::end(node->src[i]->ne), node_key.src_ne[i].begin());
         node_key.src_nb.resize(i + 1);
         std::copy(std::begin(node->src[i]->nb), std::end(node->src[i]->nb), node_key.src_nb[i].begin());
     }
 
+    node_key.dst_data = node->data;
+
     return node_key;
 }
+
+struct DmlReusedCommandListState {
+  std::vector<std::unique_ptr<DmlOperator>> operators;
+  ComPtr<ID3D12GraphicsCommandList> command_list;
+  ComPtr<ID3D12CommandAllocator> command_allocator;
+  std::unordered_set<NodeKey> keys;
+
+  // TODO (pavignol): We should have a single temporary resource that can get reused between operators, as long as there's a barrier between them
+  // (which can be achieved with a dependency graph)
+  std::vector<ComPtr<ID3D12Resource>> temporary_resources;
+};
 
 struct ggml_directml_context {
     int device;
     ComPtr<ID3D12Device> d3d12_device;
+    ComPtr<IDMLCommandRecorder> dml_recorder;
     ComPtr<IDMLDevice> dml_device;
     std::string name;
     ComPtr<ID3D12CommandQueue> d3d12_queue;
@@ -357,7 +381,7 @@ struct ggml_directml_context {
     std::shared_ptr<Dml::DmlGpuAllocator> allocator;
     Dml::ReadbackHeap readback_heap;
     Dml::DmlCommandRecorder* current_recorder = nullptr;
-    std::unordered_map<NodeKey, std::vector<std::unique_ptr<DmlOperator>>> operator_cache;
+    DmlReusedCommandListState reused_command_list_state;
 
     ggml_directml_context(int device)
         : device(device)
@@ -373,6 +397,9 @@ struct ggml_directml_context {
         , readback_heap(d3d12_device.Get()) {
         THROW_IF_FAILED(d3d12_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence.ReleaseAndGetAddressOf())));
         execution_context->SetAllocator(allocator);
+
+        // Create the DML recorder. It is stateless, so we can use the same recorder for all recording operations for the duration of the program.
+        THROW_IF_FAILED(dml_device->CreateCommandRecorder(IID_PPV_ARGS(dml_recorder.GetAddressOf())));
     }
 };
 
@@ -509,7 +536,7 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
             preprocess = [tensor](byte* uploadHeapData, const uint8_t* srcData) {
                 constexpr uint32_t block_size = sizeof(block_q6_K);
                 constexpr uint32_t block_size_without_scale = block_size - sizeof(ggml_fp16_t);
-                const uint32_t num_blocks = tensor->nb[GGML_MAX_DIMS - 1] / block_size;
+                const uint32_t num_blocks = static_cast<uint32_t>(tensor->nb[GGML_MAX_DIMS - 1]) / block_size;
                 uint32_t preprocessed_quantized_index = 0;
                 uint32_t preprocessed_scale_index = num_blocks * block_size_without_scale;
                 auto dst_bytes = reinterpret_cast<uint8_t*>(uploadHeapData);
@@ -1278,84 +1305,67 @@ static float fp16_to_fp32(ggml_fp16_t value) {
     return static_cast<float>(GGML_COMPUTE_FP16_TO_FP32(value));
 }
 
-static std::vector<DmlOperator*> find_operators(const NodeKey& node_key) {
-    auto iter = s_directml_context->operator_cache.find(node_key);
-
-    if (iter != s_directml_context->operator_cache.end()) {
-        std::vector<DmlOperator*> old_op_pointers;
-        old_op_pointers.reserve(iter->second.size());
-
-        for (const auto& old_op : iter->second) {
-            old_op_pointers.push_back(old_op.get());
-        }
-
-        return old_op_pointers;
-    }
-
-    return {};
-}
-
-static DmlOperator* find_operator(const NodeKey& new_node_key) {
-    auto operators = find_operators(new_node_key);
-    assert(operators.size() < 2);
-    return operators.empty() ? nullptr : operators[0];
-}
-
-static void cache_operator(NodeKey&& node_key, std::unique_ptr<DmlOperator>&& cache_dml_op) {
-    std::vector<std::unique_ptr<DmlOperator>> operators;
-    operators.push_back(std::move(cache_dml_op));
-    s_directml_context->operator_cache.emplace(std::move(node_key), std::move(operators));
-}
-
-static void cache_operators(NodeKey&& node_key, std::vector<std::unique_ptr<DmlOperator>>&& cache_dml_ops) {
-    s_directml_context->operator_cache.emplace(std::move(node_key), std::move(cache_dml_ops));
-}
-
 static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     std::unordered_map<ggml_tensor*, dml::Expression> nodes;
     std::vector<std::vector<Dml::D3D12BufferRegion>> operator_inputs;
     std::vector<std::vector<Dml::D3D12BufferRegion>> operator_outputs;
-    std::vector<DmlOperator*> dml_operators;
 
-//     bool reuse_command_list = true;
-// 
-//     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
-//         if (!reuse_command_list) {
-//             break;
-//         }
-// 
-//         auto node = cgraph->nodes[node_index];
-// 
-//         switch (node->op) {
-//             case GGML_OP_RMS_NORM:
-//             case GGML_OP_MUL_MAT:
-//             case GGML_OP_MUL:
-//             case GGML_OP_ROPE:
-//             case GGML_OP_CPY:
-//             case GGML_OP_CONT:
-//             case GGML_OP_SOFT_MAX:
-//             case GGML_OP_ADD:
-//             case GGML_OP_UNARY:
-//                 {
-//                     auto node_key = make_node_key(node);
-//                     if (s_directml_context->operator_cache.find(node_key) == s_directml_context->operator_cache.end()) {
-//                         reuse_command_list = false;
-//                     }
-//                 }
-//                 break;
-//             case GGML_OP_TRANSPOSE:
-//             case GGML_OP_PERMUTE:
-//             case GGML_OP_RESHAPE:
-//             case GGML_OP_VIEW:
-//             case GGML_OP_NONE:
-//                 // Nothing to do here yet, but we may have to implement it if we move to a graph
-//                 break;
-//             default:
-//                 THROW_HR(E_NOTIMPL);
-//         }
-//     }
-// 
-//     printf("Reuse command list: %d\n", reuse_command_list);
+    bool reuse_command_list = true;
+
+    for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
+        if (!reuse_command_list) {
+            break;
+        }
+
+        auto node = cgraph->nodes[node_index];
+
+        switch (node->op) {
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_MUL_MAT:
+            case GGML_OP_MUL:
+            case GGML_OP_ROPE:
+            case GGML_OP_CPY:
+            case GGML_OP_CONT:
+            case GGML_OP_SOFT_MAX:
+            case GGML_OP_ADD:
+            case GGML_OP_UNARY:
+                {
+                    auto node_key = make_node_key(node);
+                    if (s_directml_context->reused_command_list_state.keys.find(node_key) == s_directml_context->reused_command_list_state.keys.end()) {
+                        reuse_command_list = false;
+                    }
+                }
+                break;
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_VIEW:
+            case GGML_OP_NONE:
+                // Nothing to do here yet, but we may have to implement it if we move to a graph
+                break;
+            default:
+                THROW_HR(E_NOTIMPL);
+        }
+    }
+
+    printf("Reuse command list: %d\n", reuse_command_list);
+
+    if (!reuse_command_list) {
+        // Completely reset the state to release the memory
+        // TODO (pavignol): Don't reset the entire state; we should be able to reuse operators that were previously compiled if the node hasn't changed
+        s_directml_context->reused_command_list_state = DmlReusedCommandListState{};
+
+        THROW_IF_FAILED(s_directml_context->d3d12_device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            IID_PPV_ARGS(s_directml_context->reused_command_list_state.command_allocator.ReleaseAndGetAddressOf())));
+
+        THROW_IF_FAILED(s_directml_context->d3d12_device->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            s_directml_context->reused_command_list_state.command_allocator.Get(),
+            nullptr,
+            IID_PPV_ARGS(s_directml_context->reused_command_list_state.command_list.ReleaseAndGetAddressOf())));
+    }
 
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         auto node = cgraph->nodes[node_index];
@@ -1398,54 +1408,58 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         switch (node->op) {
             case GGML_OP_RMS_NORM:
                 {
-                    auto node_key = make_node_key(node);
-                    auto dml_op = find_operator(node_key);
+                    float epsilon;
+                    memcpy(&epsilon, node->op_params, sizeof(float));
+                    auto result = create_rmsnorm(scope, node_inputs, dml_output_desc, epsilon);
+                    auto dml_op = std::make_unique<DmlGraphOperator>(
+                        scope,
+                        result,
+                        s_directml_context->d3d12_device.Get(),
+                        s_directml_context->dml_device.Get(),
+                        s_directml_context->dml_recorder.Get(),
+                        s_directml_context->execution_context.get(),
+                        *s_directml_context->allocator
+                    );
 
-                    if (!dml_op) {
-                        float epsilon;
-                        memcpy(&epsilon, node->op_params, sizeof(float));
-                        auto result = create_rmsnorm(scope, node_inputs, dml_output_desc, epsilon);
-                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
-                        dml_op = cache_dml_op.get();
-                        cache_operator(std::move(node_key), std::move(cache_dml_op));
-                    }
-
-                    dml_operators.push_back(dml_op);
-                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                    std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
                     });
-                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                    std::vector<Dml::D3D12BufferRegion> output_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
-                    }));
+                    });
+
+                    // Record the operator
+                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
+
+                    // Cache the operator and its key in the command list state
+                    s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
+                    s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
                 }
                 break;
             case GGML_OP_MUL_MAT:
                 {
                     if (node->src[0]->type == GGML_TYPE_Q6_K) {
-                        auto node_key = make_node_key(node);
-                        auto dml_ops = find_operators(node_key);
-
                         const auto dequantized_tensor_sizes = ggml_to_dml_sizes(node->src[0]);
                         const auto dequantized_data_type = ggml_to_dml_datatype(node->type);
                         const auto dequantized_tensor_desc = dml::TensorDesc(dequantized_data_type, dequantized_tensor_sizes);
 
-                        if (dml_ops.empty()) {
-                            uint32_t k = static_cast<uint32_t>(node->src[0]->ne[0] * node->src[0]->ne[1]);
-                            auto dequantize_op = create_dequantize_int6(k, ggml_to_dml_datatype(node->type));
+                        uint32_t k = static_cast<uint32_t>(node->src[0]->ne[0] * node->src[0]->ne[1]);
+                        auto dequantize_op = create_dequantize_int6(k, ggml_to_dml_datatype(node->type));
 
-                            std::vector<dml::Expression> matmul_inputs = {
-                                dml::InputTensor(scope, 0, dequantized_tensor_desc),
-                                dml::InputTensor(scope, 1, ggml_to_dml_tensor_desc(node->src[1])),
-                            };
-                            auto matmul_op = create_matmul(scope, matmul_inputs, dml_output_desc);
-                            auto cache_matmul_op = std::make_unique<DmlGraphOperator>(scope, matmul_op, s_directml_context->execution_context.get(), *s_directml_context->allocator);
-
-                            dml_ops = {dequantize_op.get(), cache_matmul_op.get()};
-                            std::vector<std::unique_ptr<DmlOperator>> cache_dml_ops;
-                            cache_dml_ops.push_back(std::move(dequantize_op));
-                            cache_dml_ops.push_back(std::move(cache_matmul_op));
-                            cache_operators(std::move(node_key), std::move(cache_dml_ops));
-                        }
+                        std::vector<dml::Expression> matmul_inputs = {
+                            dml::InputTensor(scope, 0, dequantized_tensor_desc),
+                            dml::InputTensor(scope, 1, ggml_to_dml_tensor_desc(node->src[1])),
+                        };
+                        auto result = create_matmul(scope, matmul_inputs, dml_output_desc);
+                        auto matmul_op = std::make_unique<DmlGraphOperator>(
+                            scope,
+                            result,
+                            s_directml_context->d3d12_device.Get(),
+                            s_directml_context->dml_device.Get(),
+                            s_directml_context->dml_recorder.Get(),
+                            s_directml_context->execution_context.get(),
+                            *s_directml_context->allocator
+                        );
 
                         ComPtr<ID3D12Resource> temp_resource;
                         auto temp_buffer = CD3DX12_RESOURCE_DESC::Buffer(dequantized_tensor_desc.totalTensorSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
@@ -1458,62 +1472,67 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                             nullptr,
                             IID_PPV_ARGS(temp_resource.GetAddressOf())
                         ));
+                        auto temp_buffer_region = Dml::D3D12BufferRegion(0, dequantized_tensor_desc.totalTensorSizeInBytes, temp_resource.Get());
 
                         // TODO (pavignol): Use pooled resources to avoid recreating them for every iteration
-                        s_directml_context->execution_context->QueueReference(temp_resource.Get());
-                        auto temp_buffer_region = Dml::D3D12BufferRegion(0, dequantized_tensor_desc.totalTensorSizeInBytes, temp_resource.Get());
+                        s_directml_context->reused_command_list_state.temporary_resources.push_back(std::move(temp_resource));
 
                         constexpr uint32_t block_size = sizeof(block_q6_K);
                         constexpr uint32_t block_size_without_scale = block_size - sizeof(ggml_fp16_t);
-                        const uint32_t num_blocks = node->src[0]->nb[GGML_MAX_DIMS - 1] / block_size;
+                        const uint32_t num_blocks = static_cast<uint32_t>(node->src[0]->nb[GGML_MAX_DIMS - 1]) / block_size;
 
                         auto quantized_buffer_region = s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, block_size_without_scale * num_blocks);
                         auto scale_buffer_region = Dml::D3D12BufferRegion(quantized_buffer_region.Offset() + block_size_without_scale * num_blocks, sizeof(ggml_fp16_t) * num_blocks, quantized_buffer_region.GetD3D12Resource());
 
-                        dml_operators.push_back(dml_ops[0]);
-                        operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                        std::vector<Dml::D3D12BufferRegion> dequantize_input_buffer_regions({
                             quantized_buffer_region,
                             scale_buffer_region,
                         });
-                        operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                        std::vector<Dml::D3D12BufferRegion> dequantize_output_buffer_regions({
                             temp_buffer_region,
-                        }));
-
-                        dml_operators.push_back(dml_ops[1]);
+                        });
 
                         // When a dmlx graph has a single operator, it gets rid of the graph and executes the operator itself. Since GEMM always has 3 inputs
                         // (the C tensor is optional but always has a bind point), we need to add an empty buffer region here.
-                        operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                        std::vector<Dml::D3D12BufferRegion> matmul_input_buffer_regions({
                             temp_buffer_region,
                             s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes),
                             Dml::D3D12BufferRegion(),
                         });
-                        operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                        std::vector<Dml::D3D12BufferRegion> matmul_output_buffer_regions({
                             s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
-                        }));
+                        });
+
+                        // Record the operators
+                        dequantize_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), dequantize_input_buffer_regions, dequantize_output_buffer_regions);
+                        matmul_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), matmul_input_buffer_regions, matmul_output_buffer_regions);
+
+                        // Cache the operator and its key in the command list state
+                        s_directml_context->reused_command_list_state.operators.push_back(std::move(dequantize_op));
+                        s_directml_context->reused_command_list_state.operators.push_back(std::move(matmul_op));
+                        s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
                     } else if (ggml_is_quantized(node->src[0]->type)) {
-                        auto node_key = make_node_key(node);
-                        auto dml_op = find_operator(node_key);
+                        DML_QUANTIZATION_TYPE quantization_type;
 
-                        if (!dml_op) {
-                            DML_QUANTIZATION_TYPE quantization_type;
-
-                            switch (node->src[0]->type) {
-                            case GGML_TYPE_Q4_0:
-                            case GGML_TYPE_Q8_0:
-                                quantization_type = DML_QUANTIZATION_TYPE_SCALE;
-                                break;
-                            default:
-                                THROW_HR(E_NOTIMPL);
-                            }
-
-                            auto result = create_quantized_matmul(scope, node_inputs, dml_output_desc, quantization_type);
-                            auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
-                            dml_op = cache_dml_op.get();
-                            cache_operator(std::move(node_key), std::move(cache_dml_op));
+                        switch (node->src[0]->type) {
+                        case GGML_TYPE_Q4_0:
+                        case GGML_TYPE_Q8_0:
+                            quantization_type = DML_QUANTIZATION_TYPE_SCALE;
+                            break;
+                        default:
+                            THROW_HR(E_NOTIMPL);
                         }
 
-                        dml_operators.push_back(dml_op);
+                        auto result = create_quantized_matmul(scope, node_inputs, dml_output_desc, quantization_type);
+                        auto dml_op = std::make_unique<DmlGraphOperator>(
+                            scope,
+                            result,
+                            s_directml_context->d3d12_device.Get(),
+                            s_directml_context->dml_device.Get(),
+                            s_directml_context->dml_recorder.Get(),
+                            s_directml_context->execution_context.get(),
+                            *s_directml_context->allocator
+                        );
 
                         auto quantized_tensor_sizes = ggml_to_dml_sizes(node->src[0]);
                         auto scale_tensor_sizes = quantized_tensor_sizes;
@@ -1525,235 +1544,273 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 
                         auto quantized_buffer_region = s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, quantized_tensor_desc.totalTensorSizeInBytes);
                         auto scale_buffer_region = Dml::D3D12BufferRegion(quantized_buffer_region.Offset() + quantized_tensor_desc.totalTensorSizeInBytes, scale_tensor_desc.totalTensorSizeInBytes, quantized_buffer_region.GetD3D12Resource());
-
-                        std::vector<Dml::D3D12BufferRegion> inputBufferRegions;
-                        inputBufferRegions.push_back(std::move(quantized_buffer_region));
-                        inputBufferRegions.push_back(std::move(scale_buffer_region));
-
                         auto a_tensor_buffer_region = s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes);
-                        inputBufferRegions.push_back(std::move(a_tensor_buffer_region));
 
-                        operator_inputs.push_back(std::move(inputBufferRegions));
-                        operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                        std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
+                            quantized_buffer_region,
+                            scale_buffer_region,
+                            a_tensor_buffer_region,
+                        });
+                        std::vector<Dml::D3D12BufferRegion> output_buffer_regions({
                             s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
-                        }));
+                        });
+
+                        // Record the operator
+                        dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
+
+                        // Cache the operator and its key in the command list state
+                        s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
+                        s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
                     } else {
-                        auto node_key = make_node_key(node);
-                        auto dml_op = find_operator(node_key);
+                        auto result = create_matmul(scope, node_inputs, dml_output_desc);
+                        auto dml_op = std::make_unique<DmlGraphOperator>(
+                            scope,
+                            result,
+                            s_directml_context->d3d12_device.Get(),
+                            s_directml_context->dml_device.Get(),
+                            s_directml_context->dml_recorder.Get(),
+                            s_directml_context->execution_context.get(),
+                            *s_directml_context->allocator
+                        );
 
-                        if (!dml_op) {
-                            auto result = create_matmul(scope, node_inputs, dml_output_desc);
-                            auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
-                            dml_op = cache_dml_op.get();
-                            cache_operator(std::move(node_key), std::move(cache_dml_op));
-                        }
-
-                        dml_operators.push_back(dml_op);
-                        operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                        std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
                             s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
                             s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes),
                         });
-                        operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                        std::vector<Dml::D3D12BufferRegion> output_buffer_regions({
                             s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
-                        }));
+                        });
+
+                        // Record the operator
+                        dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
+
+                        // Cache the operator and its key in the command list state
+                        s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
+                        s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
                     }
                 }
                 break;
             case GGML_OP_MUL:
                 {
-                    auto node_key = make_node_key(node);
-                    auto dml_op = find_operator(node_key);
+                    auto result = create_multiply(scope, node_inputs, dml_output_desc);
+                    auto dml_op = std::make_unique<DmlGraphOperator>(
+                        scope,
+                        result,
+                        s_directml_context->d3d12_device.Get(),
+                        s_directml_context->dml_device.Get(),
+                        s_directml_context->dml_recorder.Get(),
+                        s_directml_context->execution_context.get(),
+                        *s_directml_context->allocator
+                    );
 
-                    if (!dml_op) {
-                        auto result = create_multiply(scope, node_inputs, dml_output_desc);
-                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
-                        dml_op = cache_dml_op.get();
-                        cache_operator(std::move(node_key), std::move(cache_dml_op));
-                    }
-
-                    dml_operators.push_back(dml_op);
-                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                    std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
                         s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes),
                     });
-                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                    std::vector<Dml::D3D12BufferRegion> output_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
-                    }));
+                    });
+
+                    // Record the operator
+                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
+
+                    // Cache the operator and its key in the command list state
+                    s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
+                    s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
                 }
                 break;
             case GGML_OP_ROPE:
                 {
-                    auto node_key = make_node_key(node);
-                    auto dml_op = find_operator(node_key);
+                    const int n_dims     = ((int32_t *) node->op_params)[1];
+                    const int mode       = ((int32_t *) node->op_params)[2];
+                    const int n_orig_ctx = ((int32_t *) node->op_params)[4];
 
-                    if (!dml_op) {
-                        const int n_dims     = ((int32_t *) node->op_params)[1];
-                        const int mode       = ((int32_t *) node->op_params)[2];
-                        const int n_orig_ctx = ((int32_t *) node->op_params)[4];
+                    float xpos_base;
+                    bool  xpos_down;
 
-                        float xpos_base;
-                        bool  xpos_down;
+                    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+                    memcpy(&freq_base,   (int32_t *) node->op_params +  5, sizeof(float));
+                    memcpy(&freq_scale,  (int32_t *) node->op_params +  6, sizeof(float));
+                    memcpy(&ext_factor,  (int32_t *) node->op_params +  7, sizeof(float));
+                    memcpy(&attn_factor, (int32_t *) node->op_params +  8, sizeof(float));
+                    memcpy(&beta_fast,   (int32_t *) node->op_params +  9, sizeof(float));
+                    memcpy(&beta_slow,   (int32_t *) node->op_params + 10, sizeof(float));
+                    memcpy(&xpos_base,   (int32_t *) node->op_params + 11, sizeof(float));
+                    memcpy(&xpos_down,   (int32_t *) node->op_params + 12, sizeof(bool));
+                    auto result = create_rope(scope, node_inputs, dml_output_desc, mode, n_dims, freq_base, freq_scale, n_orig_ctx, ext_factor, attn_factor, beta_fast, beta_slow, xpos_base, xpos_down);
 
-                        float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
-                        memcpy(&freq_base,   (int32_t *) node->op_params +  5, sizeof(float));
-                        memcpy(&freq_scale,  (int32_t *) node->op_params +  6, sizeof(float));
-                        memcpy(&ext_factor,  (int32_t *) node->op_params +  7, sizeof(float));
-                        memcpy(&attn_factor, (int32_t *) node->op_params +  8, sizeof(float));
-                        memcpy(&beta_fast,   (int32_t *) node->op_params +  9, sizeof(float));
-                        memcpy(&beta_slow,   (int32_t *) node->op_params + 10, sizeof(float));
-                        memcpy(&xpos_base,   (int32_t *) node->op_params + 11, sizeof(float));
-                        memcpy(&xpos_down,   (int32_t *) node->op_params + 12, sizeof(bool));
-                        auto result = create_rope(scope, node_inputs, dml_output_desc, mode, n_dims, freq_base, freq_scale, n_orig_ctx, ext_factor, attn_factor, beta_fast, beta_slow, xpos_base, xpos_down);
+                    auto dml_op = std::make_unique<DmlGraphOperator>(
+                        scope,
+                        result,
+                        s_directml_context->d3d12_device.Get(),
+                        s_directml_context->dml_device.Get(),
+                        s_directml_context->dml_recorder.Get(),
+                        s_directml_context->execution_context.get(),
+                        *s_directml_context->allocator
+                    );
 
-                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
-                        dml_op = cache_dml_op.get();
-                        cache_operator(std::move(node_key), std::move(cache_dml_op));
-                    }
-
-                    dml_operators.push_back(dml_op);
-                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                    std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
                         s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes),
                     });
-                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                    std::vector<Dml::D3D12BufferRegion> output_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
-                    }));
+                    });
+
+                    // Record the operator
+                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
+
+                    // Cache the operator and its key in the command list state
+                    s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
+                    s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
                 }
                 break;
             case GGML_OP_CPY:
             case GGML_OP_CONT:
                 {
-                    auto node_key = make_node_key(node);
-                    auto dml_op = find_operator(node_key);
+                    auto dml_op = create_copy(scope, node_inputs, dml_output_desc);
 
-                    if (!dml_op) {
-                        auto cache_dml_op = create_copy(scope, node_inputs, dml_output_desc);
-                        dml_op = cache_dml_op.get();
-                        cache_operator(std::move(node_key), std::move(cache_dml_op));
-                    }
-
-                    dml_operators.push_back(dml_op);
-                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                    std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
                     });
-                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                    std::vector<Dml::D3D12BufferRegion> output_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
-                    }));
+                    });
+
+                    // Record the operator
+                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
+
+                    // Cache the operator and its key in the command list state
+                    s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
+                    s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
                 }
                 break;
             case GGML_OP_SOFT_MAX:
                 {
-                    auto node_key = make_node_key(node);
-                    auto dml_op = find_operator(node_key);
+                    float scale;
+                    memcpy(&scale, node->op_params, sizeof(float));
+                    float max_bias;
+                    memcpy(&max_bias, (float *) node->op_params + 1, sizeof(float));
+                    auto result = create_softmax(scope, node_inputs, dml_output_desc, scale, max_bias);
+                    auto dml_op = std::make_unique<DmlGraphOperator>(
+                        scope,
+                        result,
+                        s_directml_context->d3d12_device.Get(),
+                        s_directml_context->dml_device.Get(),
+                        s_directml_context->dml_recorder.Get(),
+                        s_directml_context->execution_context.get(),
+                        *s_directml_context->allocator
+                    );
 
-                    if (!dml_op) {
-                        float scale;
-                        memcpy(&scale, node->op_params, sizeof(float));
-                        float max_bias;
-                        memcpy(&max_bias, (float *) node->op_params + 1, sizeof(float));
-                        auto result = create_softmax(scope, node_inputs, dml_output_desc, scale, max_bias);
-                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
-                        dml_op = cache_dml_op.get();
-                        cache_operator(std::move(node_key), std::move(cache_dml_op));
-                    }
-
-                    dml_operators.push_back(dml_op);
-                    std::vector<Dml::D3D12BufferRegion> ggml_input_tensors = {
+                    std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
-                    };
+                    });
 
                     if (node->src[1]) {
                         auto input_buffer_region = s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes);
-                        ggml_input_tensors.push_back(input_buffer_region);
+                        input_buffer_regions.push_back(input_buffer_region);
                     }
 
-                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{std::move(ggml_input_tensors)});
-                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                    std::vector<Dml::D3D12BufferRegion> output_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
-                    }));
+                    });
+
+                    // Record the operator
+                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
+
+                    // Cache the operator and its key in the command list state
+                    s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
+                    s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
                 }
                 break;
             case GGML_OP_ADD:
                 {
-                    auto node_key = make_node_key(node);
-                    auto dml_op = find_operator(node_key);
+                    auto result = create_add(scope, node_inputs, dml_output_desc);
+                    auto dml_op = std::make_unique<DmlGraphOperator>(
+                        scope,
+                        result,
+                        s_directml_context->d3d12_device.Get(),
+                        s_directml_context->dml_device.Get(),
+                        s_directml_context->dml_recorder.Get(),
+                        s_directml_context->execution_context.get(),
+                        *s_directml_context->allocator
+                    );
 
-                    if (!dml_op) {
-                        auto result = create_add(scope, node_inputs, dml_output_desc);
-                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
-                        dml_op = cache_dml_op.get();
-                        cache_operator(std::move(node_key), std::move(cache_dml_op));
-                    }
-
-                    dml_operators.push_back(dml_op);
-                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                    std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
                         s_directml_context->allocator->CreateBufferRegion(node->src[1]->data, ggml_to_dml_tensor_desc(node->src[1]).totalTensorSizeInBytes),
                     });
-                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                    std::vector<Dml::D3D12BufferRegion> output_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
-                    }));
+                    });
+
+                    // Record the operator
+                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
+
+                    // Cache the operator and its key in the command list state
+                    s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
+                    s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
                 }
                 break;
             case GGML_OP_UNARY:
                 {
-                    auto node_key = make_node_key(node);
-                    auto dml_op = find_operator(node_key);
+                    dml::Expression result;
 
-                    if (!dml_op) {
-                        dml::Expression result;
-
-                        switch (ggml_get_unary_op(node)) {
-                        case GGML_UNARY_OP_RELU:
-                            result = create_relu(scope, node_inputs, dml_output_desc);
-                            break;
-                        case GGML_UNARY_OP_GELU_QUICK:
-                        case GGML_UNARY_OP_GELU:
-                            result = create_gelu(scope, node_inputs, dml_output_desc);
-                            break;
-                        case GGML_UNARY_OP_SILU:
-                            result = create_silu(scope, node_inputs, dml_output_desc);
-                            break;
-                        case GGML_UNARY_OP_ABS:
-                            result = create_abs(scope, node_inputs, dml_output_desc);
-                            break;
-                        case GGML_UNARY_OP_NEG:
-                            result = create_neg(scope, node_inputs, dml_output_desc);
-                            break;
-                        case GGML_UNARY_OP_TANH:
-                            result = create_tanh(scope, node_inputs, dml_output_desc);
-                            break;
-                        case GGML_UNARY_OP_ELU:
-                            result = create_elu(scope, node_inputs, dml_output_desc);
-                            break;
-                        case GGML_UNARY_OP_HARDSIGMOID:
-                            result = create_hardsigmoid(scope, node_inputs, dml_output_desc);
-                            break;
-                        case GGML_UNARY_OP_SGN:
-                            result = create_signum(scope, node_inputs, dml_output_desc);
-                            break;
-                        case GGML_UNARY_OP_STEP:
-                            result = create_step(scope, node_inputs, dml_output_desc);
-                            break;
-                        case GGML_UNARY_OP_HARDSWISH:
-                            result = create_hardswish(scope, node_inputs, dml_output_desc);
-                            break;
-                        default:
-                            THROW_HR(E_NOTIMPL);
-                        }
-
-                        auto cache_dml_op = std::make_unique<DmlGraphOperator>(scope, result, s_directml_context->execution_context.get(), *s_directml_context->allocator);
-                        dml_op = cache_dml_op.get();
-                        cache_operator(std::move(node_key), std::move(cache_dml_op));
+                    switch (ggml_get_unary_op(node)) {
+                    case GGML_UNARY_OP_RELU:
+                        result = create_relu(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_GELU_QUICK:
+                    case GGML_UNARY_OP_GELU:
+                        result = create_gelu(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_SILU:
+                        result = create_silu(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_ABS:
+                        result = create_abs(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_NEG:
+                        result = create_neg(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_TANH:
+                        result = create_tanh(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_ELU:
+                        result = create_elu(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_HARDSIGMOID:
+                        result = create_hardsigmoid(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_SGN:
+                        result = create_signum(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_STEP:
+                        result = create_step(scope, node_inputs, dml_output_desc);
+                        break;
+                    case GGML_UNARY_OP_HARDSWISH:
+                        result = create_hardswish(scope, node_inputs, dml_output_desc);
+                        break;
+                    default:
+                        THROW_HR(E_NOTIMPL);
                     }
 
-                    dml_operators.push_back(dml_op);
-                    operator_inputs.push_back(std::vector<Dml::D3D12BufferRegion>{
+                    auto dml_op = std::make_unique<DmlGraphOperator>(
+                        scope,
+                        result,
+                        s_directml_context->d3d12_device.Get(),
+                        s_directml_context->dml_device.Get(),
+                        s_directml_context->dml_recorder.Get(),
+                        s_directml_context->execution_context.get(),
+                        *s_directml_context->allocator
+                    );
+
+                    std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->src[0]->data, ggml_to_dml_tensor_desc(node->src[0]).totalTensorSizeInBytes),
                     });
-                    operator_outputs.push_back(std::vector<Dml::D3D12BufferRegion>({
+                    std::vector<Dml::D3D12BufferRegion> output_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
-                    }));
+                    });
                 }
                 break;
             case GGML_OP_TRANSPOSE:
@@ -1770,10 +1827,9 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         scope.PopName();
     }
 
-    for (int operator_index = 0; operator_index < dml_operators.size(); ++operator_index) {
-        dml_operators[operator_index]->Execute(operator_inputs[operator_index], operator_outputs[operator_index]);
-
+    // TODO (pavignol): Remove this part
 /*
+    for (int operator_index = 0; operator_index < dml_operators.size(); ++operator_index) {
         std::vector<std::vector<uint8_t>> srcData(current_operator_inputs.size());
         for (int i = 0; i < current_operator_inputs.size(); ++i) {
             srcData[i] = std::vector<uint8_t>(ggml_to_dml_tensor_desc(current_operator_inputs[i]).totalTensorSizeInBytes);
@@ -1808,13 +1864,13 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
             s_directml_context->readback_heap.ReadbackFromGpu(s_directml_context->execution_context.get(), reinterpret_cast<uint8_t*>(dstData.data()), dstData.size(), srcResource, bufferRegion.Offset(), srcState);
             // printf("Downloaded!\n");
         }
-*/
     }
+*/
 
-    if (!dml_operators.empty()) {
+    if (!s_directml_context->reused_command_list_state.operators.empty()) {
         ComPtr<ID3D12Fence> fence;
         uint64_t completion_value;
-        s_directml_context->execution_context->ExecuteCommandList(nullptr, fence.GetAddressOf(), &completion_value);
+        s_directml_context->execution_context->ExecuteCommandList(s_directml_context->reused_command_list_state.command_list.Get(), fence.GetAddressOf(), &completion_value);
     }
 
     return true;

@@ -21,7 +21,8 @@ public:
         DML_TENSOR_DATA_TYPE input_data_type,
         DML_TENSOR_DATA_TYPE output_data_type);
 
-    void Execute(
+    void RecordDispatch(
+        ID3D12GraphicsCommandList* command_list,
         const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
         const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions) final;
 
@@ -34,6 +35,7 @@ private:
     ComPtr<ID3D12Device> m_device;
     ComPtr<ID3D12RootSignature> m_rootSignature;
     ComPtr<ID3D12PipelineState> m_pipelineState;
+    ComPtr<ID3D12DescriptorHeap> m_heap;
     Constants m_constants;
     uint32_t m_groupCount;
     Dml::ExecutionContext* m_executionContext;

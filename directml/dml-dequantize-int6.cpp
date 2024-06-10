@@ -81,7 +81,8 @@ DmlDequantizeInt6Operator::DmlDequantizeInt6Operator(
 void DmlDequantizeInt6Operator::RecordDispatch(
     ID3D12GraphicsCommandList* command_list,
     const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions)
+    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
+    const Dml::D3D12BufferRegion& temporary_buffer_region)
 {
     // Execute the operator
     Dml::DmlCommandRecorder::RecordCustomOperatorDispatchByGroup(

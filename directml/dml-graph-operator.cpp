@@ -38,17 +38,6 @@ DmlGraphOperator::DmlGraphOperator(
         m_persistentResourceBindingDesc = DML_BINDING_DESC{ DML_BINDING_TYPE_BUFFER, &m_persistentResourceBinding };
     }
 
-    // Create a temporary resource for executing the op, if it's required.
-    uint64_t temporaryResourceSize = m_compiledOp->GetBindingProperties().TemporaryResourceSize;
-    if (temporaryResourceSize > 0)
-    {
-        // TODO (pavignol): Use a global temporary resource instead since the temporary resource can be reused as soon as the operator is
-        // recorded (as long as 2 operators are not executed at the same time)
-        m_temporaryBuffer = allocator.AllocateDefaultBuffer(temporaryResourceSize, Dml::AllocatorRoundingMode::Disabled);
-        m_temporaryResourceBinding = m_temporaryBuffer->GetBufferBinding();
-        m_temporaryResourceBindingDesc = DML_BINDING_DESC{ DML_BINDING_TYPE_BUFFER, &m_temporaryResourceBinding };
-    }
-
     DML_BINDING_DESC initInputBindings{};
 
     executionContext->InitializeOperator(
@@ -60,7 +49,8 @@ DmlGraphOperator::DmlGraphOperator(
 void DmlGraphOperator::ExecuteGraphOperator(
     ID3D12GraphicsCommandList* command_list,
     const std::vector<DML_BINDING_DESC>& inputBindings,
-    const std::vector<DML_BINDING_DESC>& outputBindings)
+    const std::vector<DML_BINDING_DESC>& outputBindings,
+    const Dml::D3D12BufferRegion& temporary_buffer_region)
 {
     m_bindingTable->Reset(&m_binding_table_desc);
 
@@ -69,9 +59,13 @@ void DmlGraphOperator::ExecuteGraphOperator(
         m_bindingTable->BindPersistentResource(&m_persistentResourceBindingDesc);
     }
 
-    if (m_temporaryResourceBindingDesc.Type != DML_BINDING_TYPE_NONE)
+    // Use the temporary resource for executing the op, if it's required.
+    uint64_t temporaryResourceSize = m_compiledOp->GetBindingProperties().TemporaryResourceSize;
+    if (temporaryResourceSize > 0)
     {
-        m_bindingTable->BindTemporaryResource(&m_temporaryResourceBindingDesc);
+        auto temporaryResourceBinding = temporary_buffer_region.GetBufferBinding();
+        auto temporaryResourceBindingDesc = DML_BINDING_DESC{ DML_BINDING_TYPE_BUFFER, &temporaryResourceBinding };
+        m_bindingTable->BindTemporaryResource(&temporaryResourceBindingDesc);
     }
 
     // Bind the inputs and outputs
@@ -98,7 +92,8 @@ void DmlGraphOperator::ExecuteGraphOperator(
 void DmlGraphOperator::RecordDispatch(
     ID3D12GraphicsCommandList* command_list,
     const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions)
+    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
+    const Dml::D3D12BufferRegion& temporary_buffer_region)
 {
     auto FillBindingsFromBuffers = [](auto& bufferBindings, auto& bindingDescs, const std::vector<Dml::D3D12BufferRegion>& bufferRegions)
     {
@@ -124,5 +119,5 @@ void DmlGraphOperator::RecordDispatch(
     FillBindingsFromBuffers(outputBufferBindings, outputBindings, output_buffer_regions);
 
     // Record the operator execution in the command list
-    ExecuteGraphOperator(command_list, inputBindings, outputBindings);
+    ExecuteGraphOperator(command_list, inputBindings, outputBindings, temporary_buffer_region);
 }

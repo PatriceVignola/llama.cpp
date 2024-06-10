@@ -17,25 +17,26 @@ public:
     void RecordDispatch(
         ID3D12GraphicsCommandList* command_list,
         const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-        const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions) final;
+        const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
+        const Dml::D3D12BufferRegion& temporary_buffer_region) final;
+
+    uint64_t GetTemporaryResourceSize() final { return m_compiledOp->GetBindingProperties().TemporaryResourceSize; }
 
 private:
     void ExecuteGraphOperator(
         ID3D12GraphicsCommandList* command_list,
         const std::vector<DML_BINDING_DESC>& inputBindings,
-        const std::vector<DML_BINDING_DESC>& outputBindings);
+        const std::vector<DML_BINDING_DESC>& outputBindings,
+        const Dml::D3D12BufferRegion& temporary_buffer_region);
 
     ComPtr<Dml::DmlManagedBuffer> m_managedPersistentBuffer;
     ComPtr<ID3D12Resource> m_persistentResource;
     Microsoft::WRL::ComPtr<IDMLCompiledOperator> m_compiledOp;
     DML_BUFFER_BINDING m_persistentResourceBinding;
     DML_BINDING_DESC m_persistentResourceBindingDesc {};
-    DML_BUFFER_BINDING m_temporaryResourceBinding;
-    DML_BINDING_DESC m_temporaryResourceBindingDesc {};
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_heap;
     Microsoft::WRL::ComPtr<IDMLBindingTable> m_bindingTable;
     IDMLCommandRecorder* m_dmlCommandRecorder;
     Optional<Dml::DmlBuffer> m_persistentBuffer;
-    Optional<Dml::DmlBuffer> m_temporaryBuffer;
     DML_BINDING_TABLE_DESC m_binding_table_desc {};
 };

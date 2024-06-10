@@ -360,10 +360,11 @@ struct DmlReusedCommandListState {
   ComPtr<ID3D12GraphicsCommandList> command_list;
   ComPtr<ID3D12CommandAllocator> command_allocator;
   std::unordered_set<NodeKey> keys;
+  Optional<Dml::DmlBuffer> temporary_buffer;
 
   // TODO (pavignol): We should have a single temporary resource that can get reused between operators, as long as there's a barrier between them
   // (which can be achieved with a dependency graph)
-  std::vector<ComPtr<ID3D12Resource>> temporary_resources;
+  std::vector<ComPtr<ID3D12Resource>> extra_temporary_resources;
 };
 
 struct ggml_directml_context {
@@ -1310,6 +1311,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
     std::vector<std::vector<Dml::D3D12BufferRegion>> operator_inputs;
     std::vector<std::vector<Dml::D3D12BufferRegion>> operator_outputs;
 
+    uint32_t operator_count = 0;
     bool reuse_command_list = true;
 
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
@@ -1333,6 +1335,8 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     auto node_key = make_node_key(node);
                     if (s_directml_context->reused_command_list_state.keys.find(node_key) == s_directml_context->reused_command_list_state.keys.end()) {
                         reuse_command_list = false;
+                    } else {
+                        ++operator_count;
                     }
                 }
                 break;
@@ -1348,7 +1352,24 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         }
     }
 
+    // If the graph doesn't have exactly the same number of DML operator as before, we also cannot reuse the command list
+    if (operator_count != s_directml_context->reused_command_list_state.keys.size()) {
+        reuse_command_list = false;
+    }
+
+    // TODO (pavignol): Remove me
     printf("Reuse command list: %d\n", reuse_command_list);
+
+    // If we can reuse the command list, we simply execute it and return early
+    if (reuse_command_list) {
+        if (!s_directml_context->reused_command_list_state.operators.empty()) {
+            ComPtr<ID3D12Fence> fence;
+            uint64_t completion_value;
+            s_directml_context->execution_context->ExecuteCommandList(s_directml_context->reused_command_list_state.command_list.Get(), fence.GetAddressOf(), &completion_value);
+        }
+
+        return true;
+    }
 
     if (!reuse_command_list) {
         // Completely reset the state to release the memory
@@ -1366,6 +1387,9 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
             nullptr,
             IID_PPV_ARGS(s_directml_context->reused_command_list_state.command_list.ReleaseAndGetAddressOf())));
     }
+
+    std::vector<std::vector<Dml::D3D12BufferRegion>> op_input_buffers;
+    std::vector<std::vector<Dml::D3D12BufferRegion>> op_output_buffers;
 
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         auto node = cgraph->nodes[node_index];
@@ -1428,12 +1452,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
                     });
 
-                    // Record the operator
-                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
-
                     // Cache the operator and its key in the command list state
                     s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
                     s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
+                    op_input_buffers.push_back(std::move(input_buffer_regions));
+                    op_output_buffers.push_back(std::move(output_buffer_regions));
                 }
                 break;
             case GGML_OP_MUL_MAT:
@@ -1475,7 +1498,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         auto temp_buffer_region = Dml::D3D12BufferRegion(0, dequantized_tensor_desc.totalTensorSizeInBytes, temp_resource.Get());
 
                         // TODO (pavignol): Use pooled resources to avoid recreating them for every iteration
-                        s_directml_context->reused_command_list_state.temporary_resources.push_back(std::move(temp_resource));
+                        s_directml_context->reused_command_list_state.extra_temporary_resources.push_back(std::move(temp_resource));
 
                         constexpr uint32_t block_size = sizeof(block_q6_K);
                         constexpr uint32_t block_size_without_scale = block_size - sizeof(ggml_fp16_t);
@@ -1503,14 +1526,14 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                             s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
                         });
 
-                        // Record the operators
-                        dequantize_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), dequantize_input_buffer_regions, dequantize_output_buffer_regions);
-                        matmul_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), matmul_input_buffer_regions, matmul_output_buffer_regions);
-
                         // Cache the operator and its key in the command list state
                         s_directml_context->reused_command_list_state.operators.push_back(std::move(dequantize_op));
                         s_directml_context->reused_command_list_state.operators.push_back(std::move(matmul_op));
                         s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
+                        op_input_buffers.push_back(std::move(dequantize_input_buffer_regions));
+                        op_input_buffers.push_back(std::move(matmul_input_buffer_regions));
+                        op_output_buffers.push_back(std::move(dequantize_output_buffer_regions));
+                        op_output_buffers.push_back(std::move(matmul_output_buffer_regions));
                     } else if (ggml_is_quantized(node->src[0]->type)) {
                         DML_QUANTIZATION_TYPE quantization_type;
 
@@ -1555,12 +1578,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                             s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
                         });
 
-                        // Record the operator
-                        dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
-
                         // Cache the operator and its key in the command list state
                         s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
                         s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
+                        op_input_buffers.push_back(std::move(input_buffer_regions));
+                        op_output_buffers.push_back(std::move(output_buffer_regions));
                     } else {
                         auto result = create_matmul(scope, node_inputs, dml_output_desc);
                         auto dml_op = std::make_unique<DmlGraphOperator>(
@@ -1581,12 +1603,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                             s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
                         });
 
-                        // Record the operator
-                        dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
-
                         // Cache the operator and its key in the command list state
                         s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
                         s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
+                        op_input_buffers.push_back(std::move(input_buffer_regions));
+                        op_output_buffers.push_back(std::move(output_buffer_regions));
                     }
                 }
                 break;
@@ -1611,12 +1632,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
                     });
 
-                    // Record the operator
-                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
-
                     // Cache the operator and its key in the command list state
                     s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
                     s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
+                    op_input_buffers.push_back(std::move(input_buffer_regions));
+                    op_output_buffers.push_back(std::move(output_buffer_regions));
                 }
                 break;
             case GGML_OP_ROPE:
@@ -1657,12 +1677,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
                     });
 
-                    // Record the operator
-                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
-
                     // Cache the operator and its key in the command list state
                     s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
                     s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
+                    op_input_buffers.push_back(std::move(input_buffer_regions));
+                    op_output_buffers.push_back(std::move(output_buffer_regions));
                 }
                 break;
             case GGML_OP_CPY:
@@ -1677,12 +1696,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
                     });
 
-                    // Record the operator
-                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
-
                     // Cache the operator and its key in the command list state
                     s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
                     s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
+                    op_input_buffers.push_back(std::move(input_buffer_regions));
+                    op_output_buffers.push_back(std::move(output_buffer_regions));
                 }
                 break;
             case GGML_OP_SOFT_MAX:
@@ -1715,12 +1733,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
                     });
 
-                    // Record the operator
-                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
-
                     // Cache the operator and its key in the command list state
                     s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
                     s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
+                    op_input_buffers.push_back(std::move(input_buffer_regions));
+                    op_output_buffers.push_back(std::move(output_buffer_regions));
                 }
                 break;
             case GGML_OP_ADD:
@@ -1744,12 +1761,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
                     });
 
-                    // Record the operator
-                    dml_op->RecordDispatch(s_directml_context->reused_command_list_state.command_list.Get(), input_buffer_regions, output_buffer_regions);
-
                     // Cache the operator and its key in the command list state
                     s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
                     s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
+                    op_input_buffers.push_back(std::move(input_buffer_regions));
+                    op_output_buffers.push_back(std::move(output_buffer_regions));
                 }
                 break;
             case GGML_OP_UNARY:
@@ -1811,6 +1827,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     std::vector<Dml::D3D12BufferRegion> output_buffer_regions({
                         s_directml_context->allocator->CreateBufferRegion(node->data, ggml_to_dml_tensor_desc(node).totalTensorSizeInBytes),
                     });
+
+                    // Cache the operator and its key in the command list state
+                    s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
+                    s_directml_context->reused_command_list_state.keys.insert(make_node_key(node));
+                    op_input_buffers.push_back(std::move(input_buffer_regions));
+                    op_output_buffers.push_back(std::move(output_buffer_regions));
                 }
                 break;
             case GGML_OP_TRANSPOSE:
@@ -1825,6 +1847,29 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         }
 
         scope.PopName();
+    }
+
+    uint64_t required_temporary_resource_size = 0;
+    for (const auto& compiled_op : s_directml_context->reused_command_list_state.operators) {
+        required_temporary_resource_size = std::max(required_temporary_resource_size, compiled_op->GetTemporaryResourceSize());
+    }
+
+    if (required_temporary_resource_size > 0) {
+        s_directml_context->reused_command_list_state.temporary_buffer = s_directml_context->allocator->AllocateDefaultBuffer(required_temporary_resource_size, Dml::AllocatorRoundingMode::Disabled);
+    }
+
+    assert(s_directml_context->reused_command_list_state.operators.size() == op_input_buffers.size());
+    assert(s_directml_context->reused_command_list_state.operators.size() == op_output_buffers.size());
+
+    for (int i = 0; i < s_directml_context->reused_command_list_state.operators.size(); ++i) {
+        auto compiled_op = s_directml_context->reused_command_list_state.operators[i].get();
+
+        // Record the operator
+        compiled_op->RecordDispatch(
+            s_directml_context->reused_command_list_state.command_list.Get(),
+            op_input_buffers[i],
+            op_output_buffers[i],
+            s_directml_context->reused_command_list_state.temporary_buffer->Region());
     }
 
     // TODO (pavignol): Remove this part

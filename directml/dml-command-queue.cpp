@@ -38,7 +38,7 @@ namespace Dml
 
     void CommandQueue::ExecuteCommandLists(const std::vector<ID3D12CommandList*>& commandLists)
     {
-        m_queue->ExecuteCommandLists(commandLists.size(), commandLists.data());
+        m_queue->ExecuteCommandLists(static_cast<uint32_t>(commandLists.size()), commandLists.data());
 
         ++m_lastFenceValue;
         THROW_IF_FAILED(m_queue->Signal(m_fence.Get(), m_lastFenceValue));

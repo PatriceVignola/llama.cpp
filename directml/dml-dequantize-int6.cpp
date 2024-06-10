@@ -116,13 +116,14 @@ void DmlDequantizeInt6Operator::UpdateBindings(
 
     constexpr size_t block_size_without_scale = sizeof(block_q6_K) - sizeof(ggml_fp16_t);
 
-    // Create the packed block UAV
+    // Create the packed block UAV. We use a raw buffer because the block has a weird byte size of 208. Even though it's a multiple of 4,
+    // the offset is not necessarily divisible by 208 so we cannot specify a structured buffer here in terms of elements.
     D3D12_UNORDERED_ACCESS_VIEW_DESC block_input_uav_desc = {};
     block_input_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-    block_input_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
-    block_input_uav_desc.Buffer.StructureByteStride = block_size_without_scale;
-    block_input_uav_desc.Buffer.FirstElement = input_buffer_regions[0].Offset() / block_size_without_scale;
-    block_input_uav_desc.Buffer.NumElements = input_buffer_regions[0].SizeInBytes() / block_size_without_scale;
+    block_input_uav_desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    block_input_uav_desc.Buffer.FirstElement = input_buffer_regions[0].Offset() / sizeof(uint32_t);
+    block_input_uav_desc.Buffer.NumElements = static_cast<uint32_t>(input_buffer_regions[0].SizeInBytes() / sizeof(uint32_t));
+    block_input_uav_desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
 
     auto block_input_cpu_handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(
         m_heap->GetCPUDescriptorHandleForHeapStart(),
@@ -138,7 +139,7 @@ void DmlDequantizeInt6Operator::UpdateBindings(
     scale_input_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
     scale_input_uav_desc.Buffer.StructureByteStride = sizeof(ggml_fp16_t);
     scale_input_uav_desc.Buffer.FirstElement = input_buffer_regions[1].Offset() / sizeof(ggml_fp16_t);
-    scale_input_uav_desc.Buffer.NumElements = input_buffer_regions[1].SizeInBytes() / sizeof(ggml_fp16_t);
+    scale_input_uav_desc.Buffer.NumElements = static_cast<uint32_t>(input_buffer_regions[1].SizeInBytes() / sizeof(ggml_fp16_t));
 
     auto scale_input_cpu_handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(
         m_heap->GetCPUDescriptorHandleForHeapStart(),
@@ -154,7 +155,7 @@ void DmlDequantizeInt6Operator::UpdateBindings(
     output_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
     output_uav_desc.Buffer.StructureByteStride = static_cast<uint32_t>(m_output_data_type_size);
     output_uav_desc.Buffer.FirstElement = output_buffer_regions[0].Offset() / m_output_data_type_size;
-    output_uav_desc.Buffer.NumElements = output_buffer_regions[0].SizeInBytes() / m_output_data_type_size;
+    output_uav_desc.Buffer.NumElements = static_cast<uint32_t>(output_buffer_regions[0].SizeInBytes() / m_output_data_type_size);
 
     auto output_cpu_handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(
         m_heap->GetCPUDescriptorHandleForHeapStart(),

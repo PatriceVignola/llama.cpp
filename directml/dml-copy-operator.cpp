@@ -159,7 +159,7 @@ void DmlCopyOperator::UpdateBindings(
     D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav_desc = {};
     output_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     output_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
-    output_uav_desc.Buffer.StructureByteStride = static_cast<uint32_t>(m_input_dtype_size);
+    output_uav_desc.Buffer.StructureByteStride = static_cast<uint32_t>(m_output_dtype_size);
     output_uav_desc.Buffer.FirstElement = output_buffer_regions[0].Offset() / m_output_dtype_size;
     output_uav_desc.Buffer.NumElements = m_constants.elementCount;
 

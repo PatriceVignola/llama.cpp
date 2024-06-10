@@ -233,6 +233,7 @@ void DmlCommandRecorder::RecordCustomOperatorDispatch(
     // Set the root signature and pipeline state
     command_list->SetComputeRootSignature(root_signature);
     command_list->SetPipelineState(pipeline_state);
+    command_list->SetDescriptorHeaps(1, &heap);
     command_list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
 
     // Set root constants
@@ -271,9 +272,6 @@ void DmlCommandRecorder::RecordCustomOperatorDispatch(
         command_list->Dispatch(dispatchSizeX, 1, 1);
     }
 
-    // Record the execution work.
-    command_list->SetDescriptorHeaps(1, &heap);
-
     // Barrier all outputs.
     // TODO (pavignol): Only barrier if needed after building the dependency graph
     std::array<D3D12_RESOURCE_BARRIER, 1> output_barriers;
@@ -295,20 +293,20 @@ void DmlCommandRecorder::RecordCustomOperatorDispatchByGroup(
     // Set the root signature and pipeline state
     command_list->SetComputeRootSignature(root_signature);
     command_list->SetPipelineState(pipeline_state);
+    command_list->SetDescriptorHeaps(1, &heap);
     command_list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
 
-    // Set root constants
-    command_list->SetComputeRoot32BitConstants(
-        1, // root parameter index
-        constant_count, // Constant count
-        constants,
-        0 // offset
-    );
+    if (constant_count > 0) {
+        // Set root constants
+        command_list->SetComputeRoot32BitConstants(
+            1, // root parameter index
+            constant_count, // Constant count
+            constants,
+            0 // offset
+        );
+    }
 
     command_list->Dispatch(groupCountX, groupCountY, groupCountZ);
-
-    // Record the execution work.
-    command_list->SetDescriptorHeaps(1, &heap);
 
     // Barrier all outputs.
     // TODO (pavignol): Only barrier if needed after building the dependency graph

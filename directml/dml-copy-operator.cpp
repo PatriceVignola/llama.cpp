@@ -146,7 +146,7 @@ void DmlCopyOperator::UpdateBindings(
     input_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
     input_uav_desc.Buffer.StructureByteStride = static_cast<uint32_t>(m_input_dtype_size);
     input_uav_desc.Buffer.FirstElement = input_buffer_regions[0].Offset() / m_input_dtype_size;
-    input_uav_desc.Buffer.NumElements = m_constants.elementCount;
+    input_uav_desc.Buffer.NumElements = input_buffer_regions[0].SizeInBytes() / m_input_dtype_size;
 
     auto input_cpu_handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(
         m_heap->GetCPUDescriptorHandleForHeapStart(),
@@ -161,7 +161,7 @@ void DmlCopyOperator::UpdateBindings(
     output_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
     output_uav_desc.Buffer.StructureByteStride = static_cast<uint32_t>(m_output_dtype_size);
     output_uav_desc.Buffer.FirstElement = output_buffer_regions[0].Offset() / m_output_dtype_size;
-    output_uav_desc.Buffer.NumElements = m_constants.elementCount;
+    output_uav_desc.Buffer.NumElements = output_buffer_regions[0].SizeInBytes() / m_output_dtype_size;
 
     auto output_cpu_handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(
         m_heap->GetCPUDescriptorHandleForHeapStart(),

@@ -1236,6 +1236,7 @@ static float fp16_to_fp32(ggml_fp16_t value) {
 static bool can_reuse_command_list(ggml_cgraph* cgraph) {
     uint32_t node_count = 0;
     uint32_t dml_node_index = 0;
+    uint32_t dml_op_index = 0;
     bool reuse_command_list = true;
 
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
@@ -1255,9 +1256,19 @@ static bool can_reuse_command_list(ggml_cgraph* cgraph) {
                     if (dml_node_index >= s_directml_context->reused_command_list_state.keys.size() ||
                         make_node_key(node) != s_directml_context->reused_command_list_state.keys[dml_node_index]) {
                         reuse_command_list = false;
+                    } else if (dml_op_index >= s_directml_context->reused_command_list_state.operators.size() ||
+                        !s_directml_context->reused_command_list_state.operators[dml_op_index]->LateBindingAllowed()) {
+                        // If late binding isn't allowed, we need to re-create the command list when bindings change
+                        reuse_command_list = false;
                     }
 
                     ++dml_node_index;
+
+                    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_Q6_K) {
+                        dml_op_index += 2;
+                    } else {
+                        ++dml_op_index;
+                    }
                 }
                 break;
             case GGML_OP_TRANSPOSE:
@@ -2015,6 +2026,10 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         s_directml_context->reused_command_list_state.temporary_buffer = s_directml_context->allocator->AllocateDefaultBuffer(required_temporary_resource_size, Dml::AllocatorRoundingMode::Disabled);
     }
 
+    if (!s_directml_context->reused_command_list_state.operators.empty()) {
+        update_bindings(cgraph);
+    }
+
     for (int i = 0; i < s_directml_context->reused_command_list_state.operators.size(); ++i) {
         auto compiled_op = s_directml_context->reused_command_list_state.operators[i].get();
 
@@ -2066,7 +2081,6 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 
     if (!s_directml_context->reused_command_list_state.operators.empty()) {
         THROW_IF_FAILED(s_directml_context->reused_command_list_state.command_list->Close());
-        update_bindings(cgraph);
 
         ComPtr<ID3D12Fence> fence;
         uint64_t completion_value;

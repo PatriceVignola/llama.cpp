@@ -44,6 +44,7 @@ public:
     }
 
     uint64_t GetTemporaryResourceSize() const final { return 0; }
+    bool LateBindingAllowed() const final { return true; }
 
 private:
     struct Constants {

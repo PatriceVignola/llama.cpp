@@ -18,4 +18,5 @@ public:
     virtual ~DmlOperator() {}
     virtual const void* GetRawInputData(int index) const = 0;
     virtual const void* GetRawOutputData() const = 0;
+    virtual bool LateBindingAllowed() const = 0;
 };

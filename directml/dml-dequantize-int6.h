@@ -41,6 +41,7 @@ public:
     }
 
     const void* GetRawOutputData() const final { return m_raw_output_data; }
+    bool LateBindingAllowed() const final { return true; }
 
 private:
     // TODO (pavignol): Clean me up

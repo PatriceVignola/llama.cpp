@@ -122,7 +122,7 @@ void DmlDequantizeInt6Operator::UpdateBindings(
     block_input_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
     block_input_uav_desc.Buffer.StructureByteStride = block_size_without_scale;
     block_input_uav_desc.Buffer.FirstElement = input_buffer_regions[0].Offset() / block_size_without_scale;
-    block_input_uav_desc.Buffer.NumElements = m_groupCount;
+    block_input_uav_desc.Buffer.NumElements = input_buffer_regions[0].SizeInBytes() / block_size_without_scale;
 
     auto block_input_cpu_handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(
         m_heap->GetCPUDescriptorHandleForHeapStart(),
@@ -137,8 +137,8 @@ void DmlDequantizeInt6Operator::UpdateBindings(
     scale_input_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     scale_input_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
     scale_input_uav_desc.Buffer.StructureByteStride = sizeof(ggml_fp16_t);
-    scale_input_uav_desc.Buffer.FirstElement = input_buffer_regions[0].Offset() / sizeof(ggml_fp16_t);
-    scale_input_uav_desc.Buffer.NumElements = m_groupCount;
+    scale_input_uav_desc.Buffer.FirstElement = input_buffer_regions[1].Offset() / sizeof(ggml_fp16_t);
+    scale_input_uav_desc.Buffer.NumElements = input_buffer_regions[1].SizeInBytes() / sizeof(ggml_fp16_t);
 
     auto scale_input_cpu_handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(
         m_heap->GetCPUDescriptorHandleForHeapStart(),
@@ -154,7 +154,7 @@ void DmlDequantizeInt6Operator::UpdateBindings(
     output_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
     output_uav_desc.Buffer.StructureByteStride = static_cast<uint32_t>(m_output_data_type_size);
     output_uav_desc.Buffer.FirstElement = output_buffer_regions[0].Offset() / m_output_data_type_size;
-    output_uav_desc.Buffer.NumElements = m_groupCount * 64 * 4; // Each group has 64 threads, and each thread writes to 4 output elements
+    output_uav_desc.Buffer.NumElements = output_buffer_regions[0].SizeInBytes() / m_output_data_type_size;
 
     auto output_cpu_handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(
         m_heap->GetCPUDescriptorHandleForHeapStart(),

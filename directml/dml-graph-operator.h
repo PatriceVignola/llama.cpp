@@ -37,6 +37,9 @@ public:
 
     uint64_t GetTemporaryResourceSize() const final { return m_compiledOp->GetBindingProperties().TemporaryResourceSize; }
 
+    // TODO (pavignol): Benchmark if disabling late binding helps performance
+    bool LateBindingAllowed() const final { return true; }
+
 private:
     ComPtr<Dml::DmlManagedBuffer> m_managedPersistentBuffer;
     ComPtr<ID3D12Resource> m_persistentResource;

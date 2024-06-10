@@ -51,19 +51,22 @@ DmlCopyOperator::DmlCopyOperator(
 
     // Compute root signature.
     const int uavCount = 2;
-    std::vector<CD3DX12_ROOT_PARAMETER1> rootParameters;
-    rootParameters.resize(uavCount + 1);
+    CD3DX12_ROOT_PARAMETER1 rootParameters[2] = {};
 
-    for (UINT i = 0; i < uavCount; i++)
-    {
-        rootParameters[i].InitAsUnorderedAccessView(i);
-    }
+    // Root parameter [0]: UAV descriptor table
+    CD3DX12_DESCRIPTOR_RANGE1 descriptorRange(
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV,    // rangeType
+        uavCount,                           // numDescriptors
+        0,                                  // baseShaderRegister
+        0,                                  // registerSpace
+        D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+    );
+    rootParameters[0].InitAsDescriptorTable(1, &descriptorRange);
 
     const int constantCount = 18;
-    rootParameters[uavCount].InitAsConstants(constantCount, 0);
+    rootParameters[1].InitAsConstants(constantCount, 0);
 
-    CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC desc;
-    desc.Init_1_1(static_cast<uint32_t>(rootParameters.size()), rootParameters.data());
+    CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC desc(ARRAYSIZE(rootParameters), rootParameters);
 
     // Create the descriptor heap
     D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap_desc = {};
@@ -88,19 +91,19 @@ DmlCopyOperator::DmlCopyOperator(
         &m_rootSignature
     ));
 
-    auto input_dtype_size = get_data_type_size(input_tensor_desc.dataType);
-    auto output_dtype_size = get_data_type_size(output_tensor_desc.dataType);
+    m_input_dtype_size = get_data_type_size(input_tensor_desc.dataType);
+    m_output_dtype_size = get_data_type_size(output_tensor_desc.dataType);
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC computePsoDesc = {};
     computePsoDesc.pRootSignature = m_rootSignature.Get();
 
-    if (input_dtype_size == 2 && output_dtype_size == 4) {
+    if (m_input_dtype_size == 2 && m_output_dtype_size == 4) {
         computePsoDesc.CS = CD3DX12_SHADER_BYTECODE(DmlCopy_16_32::g_main, sizeof(DmlCopy_16_32::g_main));
-    } else if (input_dtype_size == 4 && output_dtype_size == 2) {
+    } else if (m_input_dtype_size == 4 && m_output_dtype_size == 2) {
         computePsoDesc.CS = CD3DX12_SHADER_BYTECODE(DmlCopy_32_16::g_main, sizeof(DmlCopy_32_16::g_main));
-    } else if (input_dtype_size == 2 && output_dtype_size == 2) {
+    } else if (m_input_dtype_size == 2 && m_output_dtype_size == 2) {
         computePsoDesc.CS = CD3DX12_SHADER_BYTECODE(DmlCopy_16_16::g_main, sizeof(DmlCopy_16_16::g_main));
-    } else if (input_dtype_size == 4 && output_dtype_size == 4) {
+    } else if (m_input_dtype_size == 4 && m_output_dtype_size == 4) {
         computePsoDesc.CS = CD3DX12_SHADER_BYTECODE(DmlCopy_32_32::g_main, sizeof(DmlCopy_32_32::g_main));
     } else {
         THROW_HR(E_NOTIMPL);
@@ -111,8 +114,6 @@ DmlCopyOperator::DmlCopyOperator(
 
 void DmlCopyOperator::RecordDispatch(
     ID3D12GraphicsCommandList* command_list,
-    const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
     const Dml::D3D12BufferRegion& temporary_buffer_region)
 {
     // Execute the operator
@@ -121,10 +122,52 @@ void DmlCopyOperator::RecordDispatch(
         m_rootSignature.Get(),
         m_pipelineState.Get(),
         m_heap.Get(),
-        input_buffer_regions,
-        output_buffer_regions,
         &m_constants,
         m_constants.elementCount,
         sizeof(m_constants) / sizeof(uint32_t)
     );
+}
+
+void DmlCopyOperator::UpdateBindings(
+    ID3D12Device* d3d12Device,
+    void** raw_input_data,
+    void* raw_output_data,
+    const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
+    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions)
+{
+    assert(input_buffer_regions.size() == 1);
+    assert(output_buffer_regions.size() == 1);
+
+    m_raw_input_data = raw_input_data[0];
+    m_raw_output_data = raw_output_data;
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC input_uav_desc = {};
+    input_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    input_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
+    input_uav_desc.Buffer.StructureByteStride = static_cast<uint32_t>(m_input_dtype_size);
+    input_uav_desc.Buffer.FirstElement = input_buffer_regions[0].Offset() / m_input_dtype_size;
+    input_uav_desc.Buffer.NumElements = m_constants.elementCount;
+
+    auto input_cpu_handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(
+        m_heap->GetCPUDescriptorHandleForHeapStart(),
+        0,
+        d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+    );
+
+    d3d12Device->CreateUnorderedAccessView(input_buffer_regions[0].GetD3D12Resource(), nullptr, &input_uav_desc, input_cpu_handle);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav_desc = {};
+    output_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    output_uav_desc.Format = DXGI_FORMAT_UNKNOWN;
+    output_uav_desc.Buffer.StructureByteStride = static_cast<uint32_t>(m_input_dtype_size);
+    output_uav_desc.Buffer.FirstElement = output_buffer_regions[0].Offset() / m_output_dtype_size;
+    output_uav_desc.Buffer.NumElements = m_constants.elementCount;
+
+    auto output_cpu_handle = CD3DX12_CPU_DESCRIPTOR_HANDLE(
+        m_heap->GetCPUDescriptorHandleForHeapStart(),
+        1,
+        d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+    );
+
+    d3d12Device->CreateUnorderedAccessView(output_buffer_regions[0].GetD3D12Resource(), nullptr, &output_uav_desc, output_cpu_handle);
 }

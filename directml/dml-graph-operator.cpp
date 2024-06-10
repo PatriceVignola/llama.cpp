@@ -12,7 +12,8 @@ DmlGraphOperator::DmlGraphOperator(
     Dml::ExecutionContext* executionContext,
     Dml::DmlGpuAllocator& allocator
 ) {
-    m_compiledOp = scope.Compile(DML_EXECUTION_FLAG_NONE, {expression});
+    // TODO (pavignol): Add fp16 compute flag
+    m_compiledOp = scope.Compile(DML_EXECUTION_FLAG_DESCRIPTORS_VOLATILE, {expression});
     m_dmlCommandRecorder = command_recorder;
 
     DML_BINDING_PROPERTIES binding_props = m_compiledOp->GetBindingProperties();
@@ -46,10 +47,8 @@ DmlGraphOperator::DmlGraphOperator(
         initInputBindings);
 }
 
-void DmlGraphOperator::ExecuteGraphOperator(
+void DmlGraphOperator::RecordDispatch(
     ID3D12GraphicsCommandList* command_list,
-    const std::vector<DML_BINDING_DESC>& inputBindings,
-    const std::vector<DML_BINDING_DESC>& outputBindings,
     const Dml::D3D12BufferRegion& temporary_buffer_region)
 {
     m_bindingTable->Reset(&m_binding_table_desc);
@@ -68,10 +67,6 @@ void DmlGraphOperator::ExecuteGraphOperator(
         m_bindingTable->BindTemporaryResource(&temporaryResourceBindingDesc);
     }
 
-    // Bind the inputs and outputs
-    m_bindingTable->BindInputs(static_cast<uint32_t>(inputBindings.size()), inputBindings.data());
-    m_bindingTable->BindOutputs(static_cast<uint32_t>(outputBindings.size()), outputBindings.data());
-
     // TODO (pavignol): Try having a single descriptor heap with a descriptor range that spans all the operators in the command list
     // Set the descriptor heap
     ID3D12DescriptorHeap* descriptorHeaps[] = { m_heap.Get() };
@@ -89,12 +84,22 @@ void DmlGraphOperator::ExecuteGraphOperator(
     #pragma warning(pop)
 }
 
-void DmlGraphOperator::RecordDispatch(
-    ID3D12GraphicsCommandList* command_list,
+void DmlGraphOperator::UpdateBindings(
+    ID3D12Device* d3d12Device,
+    void** raw_input_data,
+    void* raw_output_data,
     const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
-    const Dml::D3D12BufferRegion& temporary_buffer_region)
+    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions)
 {
+    m_raw_input_data.resize(input_buffer_regions.size());
+
+    for (int i = 0; i < input_buffer_regions.size(); ++i) {
+        m_raw_input_data[i] = raw_input_data[i];
+    }
+
+    assert(output_buffer_regions.size() == 1);
+    m_raw_output_data = raw_output_data;
+
     auto FillBindingsFromBuffers = [](auto& bufferBindings, auto& bindingDescs, const std::vector<Dml::D3D12BufferRegion>& bufferRegions)
     {
         for (auto& bufferRegion : bufferRegions)
@@ -118,6 +123,8 @@ void DmlGraphOperator::RecordDispatch(
     outputBindings.reserve(output_buffer_regions.size());
     FillBindingsFromBuffers(outputBufferBindings, outputBindings, output_buffer_regions);
 
-    // Record the operator execution in the command list
-    ExecuteGraphOperator(command_list, inputBindings, outputBindings, temporary_buffer_region);
+    // Bind the inputs and outputs (the temporary and persistent bindings shouldn't change)
+    m_bindingTable->Reset(&m_binding_table_desc);
+    m_bindingTable->BindInputs(static_cast<uint32_t>(inputBindings.size()), inputBindings.data());
+    m_bindingTable->BindOutputs(static_cast<uint32_t>(outputBindings.size()), outputBindings.data());
 }

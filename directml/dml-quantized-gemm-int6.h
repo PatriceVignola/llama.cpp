@@ -23,11 +23,27 @@ public:
 
     void RecordDispatch(
         ID3D12GraphicsCommandList* command_list,
-        const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-        const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
         const Dml::D3D12BufferRegion& temporary_buffer_region) final;
 
-    uint64_t GetTemporaryResourceSize() final { return 0; }
+    void UpdateBindings(
+        ID3D12Device* d3d12Device,
+        void** raw_input_data,
+        void* raw_output_data,
+        const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
+        const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions
+    ) final {
+        THROW_HR(E_NOTIMPL);
+    }
+
+    const void* GetRawInputData(int index) const final {
+        THROW_HR(E_NOTIMPL);
+    }
+
+    const void* GetRawOutputData() const final {
+        THROW_HR(E_NOTIMPL);
+    }
+
+    uint64_t GetTemporaryResourceSize() const final { return 0; }
 
 private:
     struct Constants {

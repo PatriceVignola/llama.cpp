@@ -47,8 +47,6 @@ namespace Dml
             ID3D12RootSignature* root_signature,
             ID3D12PipelineState* pipeline_state,
             ID3D12DescriptorHeap* heap,
-            const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-            const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
             const void* constants,
             uint32_t total_element_count,
             uint32_t constant_count);
@@ -58,8 +56,6 @@ namespace Dml
             ID3D12RootSignature* root_signature,
             ID3D12PipelineState* pipeline_state,
             ID3D12DescriptorHeap* heap,
-            const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-            const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
             const void* constants,
             uint32_t constant_count,
             uint32_t groupCountX,

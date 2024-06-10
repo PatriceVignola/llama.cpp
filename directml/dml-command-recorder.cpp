@@ -226,8 +226,6 @@ void DmlCommandRecorder::RecordCustomOperatorDispatch(
     ID3D12RootSignature* root_signature,
     ID3D12PipelineState* pipeline_state,
     ID3D12DescriptorHeap* heap,
-    const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
     const void* constants,
     uint32_t total_element_count,
     uint32_t constant_count)
@@ -235,15 +233,15 @@ void DmlCommandRecorder::RecordCustomOperatorDispatch(
     // Set the root signature and pipeline state
     command_list->SetComputeRootSignature(root_signature);
     command_list->SetPipelineState(pipeline_state);
+    command_list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
 
-    uint32_t uav_view_index = 0;
-    for (const auto& input_buffer_region : input_buffer_regions) {
-        command_list->SetComputeRootUnorderedAccessView(uav_view_index++, input_buffer_region.GetD3D12Resource()->GetGPUVirtualAddress() + input_buffer_region.Offset());
-    }
-
-    for (const auto& output_buffer_region : output_buffer_regions) {
-        command_list->SetComputeRootUnorderedAccessView(uav_view_index++, output_buffer_region.GetD3D12Resource()->GetGPUVirtualAddress() + output_buffer_region.Offset());
-    }
+    // Set root constants
+    command_list->SetComputeRoot32BitConstants(
+        1, // root parameter index
+        constant_count, // Constant count
+        constants,
+        0 // offset
+    );
 
     auto pendingElementCount = total_element_count;
 
@@ -262,17 +260,9 @@ void DmlCommandRecorder::RecordCustomOperatorDispatch(
             pendingElementCount
         );
 
-        // Set root constants
-        command_list->SetComputeRoot32BitConstants(
-            static_cast<uint32_t>(input_buffer_regions.size() + output_buffer_regions.size()), // root parameter index
-            constant_count, // Constant count
-            constants,
-            0 // offset
-        );
-
         // Set the start index
         command_list->SetComputeRoot32BitConstants(
-            static_cast<uint32_t>(input_buffer_regions.size() + output_buffer_regions.size()), // root parameter index
+            1, // root parameter index
             1, // Constant count
             &startIndex,
             constant_count - 1 // offset
@@ -286,11 +276,8 @@ void DmlCommandRecorder::RecordCustomOperatorDispatch(
 
     // Barrier all outputs.
     // TODO (pavignol): Only barrier if needed after building the dependency graph
-    std::vector<D3D12_RESOURCE_BARRIER> output_barriers(output_buffer_regions.size());
-    for (int i = 0; i < output_buffer_regions.size(); ++i) {
-        output_barriers[i] = CD3DX12_RESOURCE_BARRIER::UAV(output_buffer_regions[i].GetD3D12Resource());
-    }
-
+    std::array<D3D12_RESOURCE_BARRIER, 1> output_barriers;
+    output_barriers[0] = CD3DX12_RESOURCE_BARRIER::UAV(nullptr);
     command_list->ResourceBarrier(static_cast<uint32_t>(output_barriers.size()), output_barriers.data());
 }
 
@@ -299,8 +286,6 @@ void DmlCommandRecorder::RecordCustomOperatorDispatchByGroup(
     ID3D12RootSignature* root_signature,
     ID3D12PipelineState* pipeline_state,
     ID3D12DescriptorHeap* heap,
-    const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
     const void* constants,
     uint32_t constant_count,
     uint32_t groupCountX,
@@ -310,19 +295,11 @@ void DmlCommandRecorder::RecordCustomOperatorDispatchByGroup(
     // Set the root signature and pipeline state
     command_list->SetComputeRootSignature(root_signature);
     command_list->SetPipelineState(pipeline_state);
-
-    uint32_t uav_view_index = 0;
-    for (const auto& input_buffer_region : input_buffer_regions) {
-        command_list->SetComputeRootUnorderedAccessView(uav_view_index++, input_buffer_region.GetD3D12Resource()->GetGPUVirtualAddress() + input_buffer_region.Offset());
-    }
-
-    for (const auto& output_buffer_region : output_buffer_regions) {
-        command_list->SetComputeRootUnorderedAccessView(uav_view_index++, output_buffer_region.GetD3D12Resource()->GetGPUVirtualAddress() + output_buffer_region.Offset());
-    }
+    command_list->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
 
     // Set root constants
     command_list->SetComputeRoot32BitConstants(
-        static_cast<uint32_t>(input_buffer_regions.size() + output_buffer_regions.size()), // root parameter index
+        1, // root parameter index
         constant_count, // Constant count
         constants,
         0 // offset
@@ -335,10 +312,8 @@ void DmlCommandRecorder::RecordCustomOperatorDispatchByGroup(
 
     // Barrier all outputs.
     // TODO (pavignol): Only barrier if needed after building the dependency graph
-    std::vector<D3D12_RESOURCE_BARRIER> output_barriers(output_buffer_regions.size());
-    for (int i = 0; i < output_buffer_regions.size(); ++i) {
-        output_barriers[i] = CD3DX12_RESOURCE_BARRIER::UAV(output_buffer_regions[i].GetD3D12Resource());
-    }
+    std::array<D3D12_RESOURCE_BARRIER, 1> output_barriers;
+    output_barriers[0] = CD3DX12_RESOURCE_BARRIER::UAV(nullptr);
     command_list->ResourceBarrier(static_cast<uint32_t>(output_barriers.size()), output_barriers.data());
 }
 

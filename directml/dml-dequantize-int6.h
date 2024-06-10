@@ -21,11 +21,26 @@ public:
 
     void RecordDispatch(
         ID3D12GraphicsCommandList* command_list,
-        const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-        const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
         const Dml::D3D12BufferRegion& temporary_buffer_region) final;
 
-    uint64_t GetTemporaryResourceSize() final { return 0; }
+    uint64_t GetTemporaryResourceSize() const final { return 0; }
+
+    void UpdateBindings(
+        ID3D12Device* d3d12Device,
+        void** raw_input_data,
+        void* raw_output_data,
+        const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
+        const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions) final;
+
+    const void* GetRawInputData(int index) const final {
+        if (index >= m_raw_input_data.size()) {
+            THROW_HR(E_UNEXPECTED);
+        }
+
+        return m_raw_input_data[index];
+    }
+
+    const void* GetRawOutputData() const final { return m_raw_output_data; }
 
 private:
     // TODO (pavignol): Clean me up
@@ -40,4 +55,7 @@ private:
     Constants m_constants;
     uint32_t m_groupCount;
     Dml::ExecutionContext* m_executionContext;
+    std::array<void*, 2> m_raw_input_data{};
+    void* m_raw_output_data = nullptr;
+    size_t m_output_data_type_size;
 };

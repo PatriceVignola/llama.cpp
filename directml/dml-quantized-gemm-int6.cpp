@@ -44,19 +44,22 @@ DmlQuantizedGemmInt6Operator::DmlQuantizedGemmInt6Operator(
 
     // Compute root signature.
     const int uavCount = 3;
-    std::vector<CD3DX12_ROOT_PARAMETER1> rootParameters;
-    rootParameters.resize(uavCount + 1);
+    CD3DX12_ROOT_PARAMETER1 rootParameters[2] = {};
 
-    for (UINT i = 0; i < uavCount; i++)
-    {
-        rootParameters[i].InitAsUnorderedAccessView(i);
-    }
+    // Root parameter [0]: UAV descriptor table
+    CD3DX12_DESCRIPTOR_RANGE1 descriptorRange(
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV,    // rangeType
+        uavCount,                           // numDescriptors
+        0,                                  // baseShaderRegister
+        0,                                  // registerSpace
+        D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+    );
+    rootParameters[0].InitAsDescriptorTable(1, &descriptorRange);
 
     const int constantCount = 2;
-    rootParameters[uavCount].InitAsConstants(constantCount, 0);
+    rootParameters[1].InitAsConstants(constantCount, 0);
 
-    CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC desc;
-    desc.Init_1_1(static_cast<uint32_t>(rootParameters.size()), rootParameters.data());
+    CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC desc(ARRAYSIZE(rootParameters), rootParameters);
 
     // Create the descriptor heap
     D3D12_DESCRIPTOR_HEAP_DESC descriptor_heap_desc = {};
@@ -101,8 +104,6 @@ DmlQuantizedGemmInt6Operator::DmlQuantizedGemmInt6Operator(
 
 void DmlQuantizedGemmInt6Operator::RecordDispatch(
     ID3D12GraphicsCommandList* command_list,
-    const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
-    const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions,
     const Dml::D3D12BufferRegion& temporary_buffer_region)
 {
     // Execute the operator
@@ -111,8 +112,6 @@ void DmlQuantizedGemmInt6Operator::RecordDispatch(
         m_rootSignature.Get(),
         m_pipelineState.Get(),
         m_heap.Get(),
-        input_buffer_regions,
-        output_buffer_regions,
         &m_constants,
         sizeof(m_constants) / sizeof(uint32_t),
         m_groupCount,

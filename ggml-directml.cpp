@@ -1234,7 +1234,6 @@ static float fp16_to_fp32(ggml_fp16_t value) {
 }
 
 static bool can_reuse_command_list(ggml_cgraph* cgraph) {
-    uint32_t node_count = 0;
     uint32_t dml_node_index = 0;
     uint32_t dml_op_index = 0;
     bool reuse_command_list = true;
@@ -1288,7 +1287,7 @@ static bool can_reuse_command_list(ggml_cgraph* cgraph) {
     }
 
     // If the graph doesn't have exactly the same number of DML operator as before, we also cannot reuse the command list
-    if (node_count != s_directml_context->reused_command_list_state.keys.size()) {
+    if (dml_node_index != s_directml_context->reused_command_list_state.keys.size()) {
         reuse_command_list = false;
     }
 
@@ -1662,9 +1661,6 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
     std::vector<std::vector<Dml::D3D12BufferRegion>> operator_outputs;
 
     bool reuse_command_list = can_reuse_command_list(cgraph);
-
-    // TODO (pavignol): Remove me
-    printf("Reuse command list: %d\n", reuse_command_list);
 
     // If we can reuse the command list, we simply execute it and return early
     if (reuse_command_list) {

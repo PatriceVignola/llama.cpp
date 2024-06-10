@@ -17,21 +17,15 @@ struct GpuEvent
     }
 
     // Blocks until IsSignaled returns true.
-    void WaitForSignal() const
-    {
-        if (IsSignaled())
-            return; // early-out
-
-        // wil::unique_handle h(CreateEvent(nullptr, TRUE, FALSE, nullptr));
-        // THROW_LAST_ERROR_IF(!h);
-
-        // THROW_IF_FAILED(fence->SetEventOnCompletion(fenceValue, h.get()));
-
-        while (!IsSignaled())
-        {
-            // DO nothing
+    void WaitForSignal() const {
+        if (IsSignaled()) {
+        return;  // early-out
         }
 
-        // WaitForSingleObject(h.get(), INFINITE);
+        while (!IsSignaled()) {
+    #if defined(_M_AMD64) || defined(__x86_64__)
+        _mm_pause();
+    #endif
+        }
     }
 };

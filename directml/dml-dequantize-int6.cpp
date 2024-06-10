@@ -93,7 +93,7 @@ void DmlDequantizeInt6Operator::RecordDispatch(
         input_buffer_regions,
         output_buffer_regions,
         &m_constants,
-        sizeof(m_constants) / sizeof(uint32_t),
+        0,
         m_groupCount,
         1,
         1);

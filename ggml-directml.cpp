@@ -185,17 +185,15 @@ static D3D12_COMMAND_LIST_TYPE CalculateCommandListType(ID3D12Device* d3d12_devi
       sizeof(feature_levels)
       ));
 
-  auto is_feature_level_1_0_core = (feature_levels.MaxSupportedFeatureLevel == D3D_FEATURE_LEVEL_1_0_CORE);
-  if (is_feature_level_1_0_core) {
-    return D3D12_COMMAND_LIST_TYPE_COMPUTE;
-  }
+  auto use_compute_command_list = (feature_levels.MaxSupportedFeatureLevel <= D3D_FEATURE_LEVEL_1_0_CORE) ||
+                                  (feature_levels.MaxSupportedFeatureLevel >= D3D_FEATURE_LEVEL_12_0);
 
-  return D3D12_COMMAND_LIST_TYPE_DIRECT;
+  return use_compute_command_list ? D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
 }
 
-static ComPtr<ID3D12CommandQueue> CreateD3d12CommandQueue(ID3D12Device* d3d12_device) {
+static ComPtr<ID3D12CommandQueue> CreateD3d12CommandQueue(ID3D12Device* d3d12_device, D3D12_COMMAND_LIST_TYPE command_list_type) {
     D3D12_COMMAND_QUEUE_DESC cmd_queue_desc = {};
-    cmd_queue_desc.Type = CalculateCommandListType(d3d12_device);
+    cmd_queue_desc.Type = command_list_type;
     cmd_queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
 
     ComPtr<ID3D12CommandQueue> cmd_queue;
@@ -373,6 +371,7 @@ struct ggml_directml_context {
     ComPtr<IDMLCommandRecorder> dml_recorder;
     ComPtr<IDMLDevice> dml_device;
     std::string name;
+    D3D12_COMMAND_LIST_TYPE command_list_type;
     ComPtr<ID3D12CommandQueue> d3d12_queue;
     std::shared_ptr<Dml::CommandQueue> command_queue;
     Dml::DmlCommandRecorder command_recorder;
@@ -389,7 +388,8 @@ struct ggml_directml_context {
         , d3d12_device(ggml_directml_create_d3d12_device())
         , dml_device(CreateDmlDevice(d3d12_device.Get()))
         , name(ggml_directml_format_name(device))
-        , d3d12_queue(CreateD3d12CommandQueue(d3d12_device.Get()))
+        , command_list_type(CalculateCommandListType(d3d12_device.Get()))
+        , d3d12_queue(CreateD3d12CommandQueue(d3d12_device.Get(), command_list_type))
         , command_queue(std::make_shared<Dml::CommandQueue>(d3d12_queue.Get()))
         , command_recorder(d3d12_device.Get(), dml_device.Get(), command_queue)
         , execution_context(std::make_shared<Dml::ExecutionContext>(d3d12_device.Get(), dml_device.Get(), d3d12_queue.Get()))
@@ -1377,12 +1377,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         s_directml_context->reused_command_list_state = DmlReusedCommandListState{};
 
         THROW_IF_FAILED(s_directml_context->d3d12_device->CreateCommandAllocator(
-            D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            s_directml_context->command_list_type,
             IID_PPV_ARGS(s_directml_context->reused_command_list_state.command_allocator.ReleaseAndGetAddressOf())));
 
         THROW_IF_FAILED(s_directml_context->d3d12_device->CreateCommandList(
             0,
-            D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            s_directml_context->command_list_type,
             s_directml_context->reused_command_list_state.command_allocator.Get(),
             nullptr,
             IID_PPV_ARGS(s_directml_context->reused_command_list_state.command_list.ReleaseAndGetAddressOf())));
@@ -1913,6 +1913,8 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 */
 
     if (!s_directml_context->reused_command_list_state.operators.empty()) {
+        THROW_IF_FAILED(s_directml_context->reused_command_list_state.command_list->Close());
+
         ComPtr<ID3D12Fence> fence;
         uint64_t completion_value;
         s_directml_context->execution_context->ExecuteCommandList(s_directml_context->reused_command_list_state.command_list.Get(), fence.GetAddressOf(), &completion_value);

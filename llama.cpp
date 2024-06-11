@@ -7961,10 +7961,17 @@ static int llama_decode_internal(
         return 1;
     }
 
+#ifdef GGML_USE_DIRECTML
+    // DML has a pretty big overhead when the size of the cache changes, so we need bigger padding increments
+    // TODO (pavignol): Find the sweet spot
+    constexpr int32_t padding_increment = 256;
+#else
+    constexpr int32_t padding_increment = 32;
+#endif
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // after enough generations, the benefit from this heuristic disappears
     // if we start defragmenting the cache, the benefit from this will be more important
-    kv_self.n = std::min((int32_t) cparams.n_ctx, std::max(32, GGML_PAD(llama_kv_cache_cell_max(kv_self), 32)));
+    kv_self.n = std::min((int32_t) cparams.n_ctx, std::max(padding_increment, GGML_PAD(llama_kv_cache_cell_max(kv_self), padding_increment)));
     //kv_self.n = llama_kv_cache_cell_max(kv_self);
 
     //printf("kv_self.n = %5d, kv_self.used = %5d, kv_self.head = %5d\n", kv_self.n, kv_self.used, kv_self.head);

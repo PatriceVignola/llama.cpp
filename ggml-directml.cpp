@@ -280,16 +280,45 @@ static NodeKey make_node_key(const ggml_tensor* node) {
     return node_key;
 }
 
+struct ReusedUploadHeap {
+    ComPtr<ID3D12Resource> upload_heap;
+    Dml::D3D12BufferRegion target_buffer_region;
+    size_t target_offset;
+    bool new_upload;
+    bool unused_upload;
+};
+
 struct DmlReusedCommandListState {
   std::vector<std::unique_ptr<DmlOperator>> operators;
   ComPtr<ID3D12GraphicsCommandList> command_list;
   ComPtr<ID3D12CommandAllocator> command_allocator;
   std::vector<NodeKey> keys;
   Optional<Dml::DmlBuffer> temporary_buffer;
+  std::unordered_map<std::string, ReusedUploadHeap> upload_heaps;
 
   // TODO (pavignol): We should have a single temporary resource that can get reused between operators, as long as there's a barrier between them
   // (which can be achieved with a dependency graph)
   std::vector<ComPtr<ID3D12Resource>> extra_temporary_resources;
+
+  void Reset() {
+    operators.clear();
+    command_list = nullptr;
+    command_allocator = nullptr;
+    keys.clear();
+    temporary_buffer = {};
+
+    // Only remove the unused uploads, and set the other uploads as "unused" for the next iteration
+    auto old_size = upload_heaps.size();
+    for (auto first = upload_heaps.begin(), last = upload_heaps.end(); first != last;)
+    {
+        if (first->second.unused_upload) {
+            first = upload_heaps.erase(first);
+        } else {
+            first->second.unused_upload = true;
+            ++first;
+        }
+    }
+  }
 };
 
 struct ggml_directml_context {
@@ -512,11 +541,50 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
         }
 
         s_directml_context->upload_heap.BeginUploadToGpu(dstData, bufferRegion.Offset() + offset, dstState, reinterpret_cast<const uint8_t*>(srcData), size, preprocess);
-    } else {
-        s_directml_context->upload_heap.BeginUploadToGpu(dstData, bufferRegion.Offset() + offset, dstState, reinterpret_cast<const uint8_t*>(srcData), size);
-    }
 
-    s_directml_context->execution_context->Flush();
+        // Frequently flush when uploading weights to make sure we don't run out of staging memory
+        s_directml_context->execution_context->Flush();
+    } else if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        s_directml_context->upload_heap.BeginUploadToGpu(dstData, bufferRegion.Offset() + offset, dstState, reinterpret_cast<const uint8_t*>(srcData), size);
+
+        // Frequently flush when uploading weights to make sure we don't run out of staging memory
+        s_directml_context->execution_context->Flush();
+    } else {
+        // Here, we upload non-weights (i.e. values that can change between runs), so we try and bake them within the command list to avoid
+        // command list execution overhead
+        auto tensor_name = std::string(tensor->name);
+        auto iter = s_directml_context->reused_command_list_state.upload_heaps.find(tensor_name);
+
+        if (iter == s_directml_context->reused_command_list_state.upload_heaps.end()) {
+            iter = s_directml_context->reused_command_list_state.upload_heaps.emplace(std::move(tensor_name), ReusedUploadHeap()).first;
+        }
+
+        if (!iter->second.upload_heap || iter->second.upload_heap->GetDesc().Width != size || iter->second.target_buffer_region != bufferRegion || iter->second.target_offset != offset) {
+            auto heap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+            auto buffer = CD3DX12_RESOURCE_DESC::Buffer(size);
+    
+            THROW_IF_FAILED(s_directml_context->d3d12_device->CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &buffer,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr,
+                IID_PPV_ARGS(iter->second.upload_heap.ReleaseAndGetAddressOf())));
+
+            iter->second.target_offset = offset;
+            iter->second.target_buffer_region = bufferRegion;
+            iter->second.new_upload = true;
+            iter->second.unused_upload = false;
+        } else {
+            iter->second.new_upload = false;
+            iter->second.unused_upload = false;
+        }
+
+        void* uploadHeapData = nullptr;
+        THROW_IF_FAILED(iter->second.upload_heap->Map(0, nullptr, &uploadHeapData));
+        memcpy(static_cast<byte*>(uploadHeapData), reinterpret_cast<const uint8_t*>(srcData), size);
+        iter->second.upload_heap->Unmap(0, nullptr);
+    }
 }
 
 static void ggml_backend_directml_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * dstData, size_t offset, size_t size) {
@@ -1238,6 +1306,13 @@ static bool can_reuse_command_list(ggml_cgraph* cgraph) {
     uint32_t dml_op_index = 0;
     bool reuse_command_list = true;
 
+    // If any of the uploads are new, we cannot reuse the command list
+    for (auto kvp : s_directml_context->reused_command_list_state.upload_heaps) {
+        if (kvp.second.new_upload || kvp.second.unused_upload) {
+            return false;
+        }
+    }
+
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         auto node = cgraph->nodes[node_index];
 
@@ -1252,13 +1327,13 @@ static bool can_reuse_command_list(ggml_cgraph* cgraph) {
             case GGML_OP_ADD:
             case GGML_OP_UNARY:
                 {
-                    if (dml_node_index >= s_directml_context->reused_command_list_state.keys.size() ||
-                        make_node_key(node) != s_directml_context->reused_command_list_state.keys[dml_node_index]) {
-                        reuse_command_list = false;
-                    } else if (dml_op_index >= s_directml_context->reused_command_list_state.operators.size() ||
-                        !s_directml_context->reused_command_list_state.operators[dml_op_index]->LateBindingAllowed()) {
-                        // If late binding isn't allowed, we need to re-create the command list when bindings change
-                        reuse_command_list = false;
+                    if (dml_node_index >= s_directml_context->reused_command_list_state.keys.size() || make_node_key(node) != s_directml_context->reused_command_list_state.keys[dml_node_index]) {
+                        return false;
+                    }
+
+                    // If late binding isn't allowed, we need to re-create the command list when bindings change
+                    if (dml_op_index >= s_directml_context->reused_command_list_state.operators.size() || !s_directml_context->reused_command_list_state.operators[dml_op_index]->LateBindingAllowed()) {
+                        return false;
                     }
 
                     ++dml_node_index;
@@ -1280,18 +1355,10 @@ static bool can_reuse_command_list(ggml_cgraph* cgraph) {
             default:
                 THROW_HR(E_NOTIMPL);
         }
-
-        if (!reuse_command_list) {
-            break;
-        }
     }
 
     // If the graph doesn't have exactly the same number of DML operator as before, we also cannot reuse the command list
-    if (dml_node_index != s_directml_context->reused_command_list_state.keys.size()) {
-        reuse_command_list = false;
-    }
-
-    return reuse_command_list;
+    return dml_node_index == s_directml_context->reused_command_list_state.keys.size();
 }
 
 static void update_bindings(ggml_cgraph* cgraph) {
@@ -1678,8 +1745,9 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
 
     // Completely reset the state to release the memory
     // TODO (pavignol): Don't reset the entire state; we should be able to reuse operators that were previously compiled if the node hasn't changed
-    s_directml_context->reused_command_list_state = DmlReusedCommandListState{};
+    s_directml_context->reused_command_list_state.Reset();
 
+    // Create the command allocator and command list
     THROW_IF_FAILED(s_directml_context->d3d12_device->CreateCommandAllocator(
         s_directml_context->command_list_type,
         IID_PPV_ARGS(s_directml_context->reused_command_list_state.command_allocator.ReleaseAndGetAddressOf())));
@@ -1690,6 +1758,35 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
         s_directml_context->reused_command_list_state.command_allocator.Get(),
         nullptr,
         IID_PPV_ARGS(s_directml_context->reused_command_list_state.command_list.ReleaseAndGetAddressOf())));
+
+    // Record the uploads
+    for (auto& kvp : s_directml_context->reused_command_list_state.upload_heaps) {
+        auto before_barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            kvp.second.target_buffer_region.GetD3D12Resource(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_DEST
+        );
+
+        s_directml_context->reused_command_list_state.command_list->ResourceBarrier(1, &before_barrier);
+        s_directml_context->reused_command_list_state.command_list->CopyBufferRegion(
+            kvp.second.target_buffer_region.GetD3D12Resource(),
+            kvp.second.target_buffer_region.Offset() + kvp.second.target_offset,
+            kvp.second.upload_heap.Get(),
+            0,
+            kvp.second.target_buffer_region.SizeInBytes());
+
+        auto after_barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            kvp.second.target_buffer_region.GetD3D12Resource(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        );
+
+        s_directml_context->reused_command_list_state.command_list->ResourceBarrier(1, &after_barrier);
+    }
+
+    // Add a UAV barrier after performing all the uploads
+    auto uav_barrier = CD3DX12_RESOURCE_BARRIER::UAV(nullptr);
+    s_directml_context->reused_command_list_state.command_list->ResourceBarrier(1, &uav_barrier);
 
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         auto node = cgraph->nodes[node_index];

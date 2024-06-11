@@ -50,6 +50,14 @@ namespace Dml
             return D3D12BufferRegion(m_offset + offset, sizeInBytes, m_resource);
         }
 
+        bool operator==(const D3D12BufferRegion& other) const {
+            return m_resource == other.m_resource && m_offset == other.m_offset && m_sizeInBytes == other.m_sizeInBytes;
+        }
+
+        bool operator!=(const D3D12BufferRegion& other) const {
+            return !(*this == other);
+        }
+
     private:
         ID3D12Resource* m_resource = nullptr;
         uint64_t m_offset = 0;

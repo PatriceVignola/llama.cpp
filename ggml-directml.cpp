@@ -832,15 +832,16 @@ static dml::Expression create_quantized_matmul(
     bTensor = dml::Dequantize(bTensor, quantization_parameters, quantization_type);
 
     // TODO (pavignol): Instead of doing this, cast all fp32 weights once at the beginning and use only fp16 tensors in the graph
-    if (aTensor.GetOutputDesc().dataType != output_tensor_desc.dataType) {
-        aTensor = dml::Cast(aTensor, output_tensor_desc.dataType);
-    }
-
-    if (bTensor.GetOutputDesc().dataType != output_tensor_desc.dataType) {
-        bTensor = dml::Cast(bTensor, output_tensor_desc.dataType);
+    if (aTensor.GetOutputDesc().dataType != bTensor.GetOutputDesc().dataType) {
+        aTensor = dml::Cast(aTensor, bTensor.GetOutputDesc().dataType);
     }
 
     auto result = dml::Gemm(aTensor, bTensor, NullOpt, DML_MATRIX_TRANSFORM_NONE, DML_MATRIX_TRANSFORM_TRANSPOSE);
+
+    if (result.GetOutputDesc().dataType != output_tensor_desc.dataType) {
+        result = dml::Cast(result, output_tensor_desc.dataType);
+    }
+
     return result;
 }
 
@@ -1304,7 +1305,6 @@ static float fp16_to_fp32(ggml_fp16_t value) {
 static bool can_reuse_command_list(ggml_cgraph* cgraph) {
     uint32_t dml_node_index = 0;
     uint32_t dml_op_index = 0;
-    bool reuse_command_list = true;
 
     // If any of the uploads are new, we cannot reuse the command list
     for (auto kvp : s_directml_context->reused_command_list_state.upload_heaps) {

@@ -1986,7 +1986,7 @@ static void fuse_gqa(ggml_tensor* node, struct ggml_cgraph * cgraph) {
     }
 
     std::array<int32_t, 4> expected_permutations = {0, 2, 1, 3};
-    if (!std::equal(expected_permutations.begin(), expected_permutations.end(), node->op_params)) {
+    if (!std::equal(expected_permutations.begin(), expected_permutations.end(), output_permute_node->op_params)) {
         return;
     }
 

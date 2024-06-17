@@ -1195,7 +1195,7 @@ static std::tuple<dml::Expression, dml::Expression, dml::Expression> create_gqa(
 
     if (sequence_length == 1) {
         auto mask_tensor = dml::InputTensor(scope, 3, mask_tensor_desc);
-        mask_tensor = -dml::Sign(mask_tensor), DML_TENSOR_DATA_TYPE_INT32;
+        mask_tensor = 1 + dml::Sign(mask_tensor), DML_TENSOR_DATA_TYPE_INT32;
 
         std::array<uint32_t, 1> axes = {static_cast<uint32_t>(mask_tensor_desc.sizes.size() - 1)};
         past_sequence_lengths_tensor = dml::Reduce(mask_tensor, DML_REDUCE_FUNCTION_SUM, axes, mask_tensor_desc.dataType);

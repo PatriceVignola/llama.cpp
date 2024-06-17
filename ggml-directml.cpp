@@ -397,6 +397,7 @@ struct dml_gqa_fusion : public dml_fusion {
 
 struct ggml_tensor_extra_directml {
     std::unique_ptr<dml_fusion> fusion;
+    bool removed = false;
 };
 
 struct ggml_backend_directml_buffer_type_context {
@@ -1409,9 +1410,16 @@ static float fp16_to_fp32(ggml_fp16_t value) {
     return static_cast<float>(GGML_COMPUTE_FP16_TO_FP32(value));
 }
 
+static bool is_dml_op(ggml_tensor* node) {
+    return node->op != GGML_OP_TRANSPOSE &&
+        node->op != GGML_OP_PERMUTE &&
+        node->op != GGML_OP_RESHAPE &&
+        node->op != GGML_OP_VIEW &&
+        node->op != GGML_OP_NONE;
+}
+
 static bool can_reuse_command_list(ggml_cgraph* cgraph) {
     uint32_t dml_node_index = 0;
-    uint32_t dml_op_index = 0;
 
     // If any of the uploads are new, we cannot reuse the command list
     for (auto kvp : s_directml_context->reused_command_list_state.upload_heaps) {
@@ -1423,49 +1431,30 @@ static bool can_reuse_command_list(ggml_cgraph* cgraph) {
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         auto node = cgraph->nodes[node_index];
 
-        switch (node->op) {
-            case GGML_OP_RMS_NORM:
-            case GGML_OP_MUL_MAT:
-            case GGML_OP_MUL:
-            case GGML_OP_ROPE:
-            case GGML_OP_CPY:
-            case GGML_OP_CONT:
-            case GGML_OP_SOFT_MAX:
-            case GGML_OP_ADD:
-            case GGML_OP_UNARY:
-                {
-                    if (dml_node_index >= s_directml_context->reused_command_list_state.keys.size() || make_node_key(node) != s_directml_context->reused_command_list_state.keys[dml_node_index]) {
-                        return false;
-                    }
-
-                    // If late binding isn't allowed, we need to re-create the command list when bindings change
-                    if (dml_op_index >= s_directml_context->reused_command_list_state.operators.size() || !s_directml_context->reused_command_list_state.operators[dml_op_index]->LateBindingAllowed()) {
-                        return false;
-                    }
-
-                    ++dml_node_index;
-
-                    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_Q6_K) {
-                        dml_op_index += 2;
-                    } else {
-                        ++dml_op_index;
-                    }
-                }
-                break;
-            case GGML_OP_TRANSPOSE:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_NONE:
-                // Nothing to do here yet, but we may have to implement it if we move to a graph
-                break;
-            default:
-                THROW_HR(E_NOTIMPL);
+        if (!is_dml_op(node)) {
+            continue;
         }
+
+        if (dml_node_index >= s_directml_context->reused_command_list_state.keys.size() || make_node_key(node) != s_directml_context->reused_command_list_state.keys[dml_node_index]) {
+            return false;
+        }
+
+        ++dml_node_index;
     }
 
     // If the graph doesn't have exactly the same number of DML operator as before, we also cannot reuse the command list
-    return dml_node_index == s_directml_context->reused_command_list_state.keys.size();
+    if (dml_node_index != s_directml_context->reused_command_list_state.keys.size()) {
+        return false;
+    }
+
+    // If late binding isn't allowed, we need to re-create the command list when bindings change
+    for (const auto& dml_op : s_directml_context->reused_command_list_state.operators) {
+        if (!dml_op->LateBindingAllowed()) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static void update_bindings(ggml_cgraph* cgraph) {
@@ -1475,6 +1464,10 @@ static void update_bindings(ggml_cgraph* cgraph) {
         auto node = cgraph->nodes[node_index];
 
         if (node->backend != GGML_BACKEND_TYPE_GPU) {
+            continue;
+        }
+
+        if (!is_dml_op(node)) {
             continue;
         }
 
@@ -1541,6 +1534,8 @@ static void update_bindings(ggml_cgraph* cgraph) {
             }
             default: THROW_HR(E_NOTIMPL);
             }
+        } else if (node_extra->removed) {
+            continue;
         }
 
         switch (node->op) {
@@ -1885,13 +1880,6 @@ static void update_bindings(ggml_cgraph* cgraph) {
                     ++dml_operator_index;
                 }
                 break;
-            case GGML_OP_TRANSPOSE:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_NONE:
-                // Nothing to do here yet, but we may have to implement it if we move to a graph
-                break;
             default:
                 THROW_HR(E_NOTIMPL);
         }
@@ -1997,15 +1985,14 @@ static void fuse_gqa(ggml_tensor* node, struct ggml_cgraph * cgraph) {
     // TODO (pavignol): Validate dimensions
 
     // Remove the intermediate nodes
-    qk_matmul_node->op = GGML_OP_NONE;
-    softmax_node->op = GGML_OP_NONE;
-    qkv_matmul_node->op = GGML_OP_NONE;
-    key_copy_node->op = GGML_OP_NONE;
-    value_copy_node->op = GGML_OP_NONE;
-    query_permute_node->op = GGML_OP_NONE;
-    value_transpose_node->op = GGML_OP_NONE;
-    output_permute_node->op = GGML_OP_NONE;
-    node->op = GGML_OP_NONE;
+    static_cast<ggml_tensor_extra_directml*>(qk_matmul_node->extra)->removed = true;
+    static_cast<ggml_tensor_extra_directml*>(softmax_node->extra)->removed = true;
+    static_cast<ggml_tensor_extra_directml*>(qkv_matmul_node->extra)->removed = true;
+    static_cast<ggml_tensor_extra_directml*>(key_copy_node->extra)->removed = true;
+    static_cast<ggml_tensor_extra_directml*>(value_copy_node->extra)->removed = true;
+    static_cast<ggml_tensor_extra_directml*>(query_permute_node->extra)->removed = true;
+    static_cast<ggml_tensor_extra_directml*>(value_transpose_node->extra)->removed = true;
+    static_cast<ggml_tensor_extra_directml*>(output_permute_node->extra)->removed = true;
 
     auto output_node_extra = static_cast<ggml_tensor_extra_directml*>(node->extra);
     auto gqa_fusion = std::make_unique<dml_gqa_fusion>();
@@ -2033,6 +2020,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
     std::vector<std::vector<Dml::D3D12BufferRegion>> operator_outputs;
 
     bool reuse_command_list = can_reuse_command_list(cgraph);
+
+    // TODO (pavignol): We should be able to only do the fusions if we cannot reuse the command list,
+    // but it is not currently possible since we don't keep fusion information around.
+    // Perform the fusions
+    fuse_patterns(cgraph);
 
     // If we can reuse the command list, we simply execute it and return early
     if (reuse_command_list) {
@@ -2093,11 +2085,12 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
     auto uav_barrier = CD3DX12_RESOURCE_BARRIER::UAV(nullptr);
     s_directml_context->reused_command_list_state.command_list->ResourceBarrier(1, &uav_barrier);
 
-    // Perform the fusions
-    fuse_patterns(cgraph);
-
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         auto node = cgraph->nodes[node_index];
+
+        if (!is_dml_op(node)) {
+            continue;
+        }
 
         if (node->backend != GGML_BACKEND_TYPE_GPU) {
             continue;
@@ -2140,6 +2133,9 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                 break;
             default: THROW_HR(E_NOTIMPL);
             }
+        } else if (node_extra->removed) {
+            s_directml_context->reused_command_list_state.keys.push_back(make_node_key(node));
+            continue;
         }
 
         for (int src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
@@ -2440,13 +2436,6 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
                     s_directml_context->reused_command_list_state.keys.push_back(make_node_key(node));
                 }
-                break;
-            case GGML_OP_TRANSPOSE:
-            case GGML_OP_PERMUTE:
-            case GGML_OP_RESHAPE:
-            case GGML_OP_VIEW:
-            case GGML_OP_NONE:
-                // Nothing to do here yet, but we may have to implement it if we move to a graph
                 break;
             default:
                 THROW_HR(E_NOTIMPL);

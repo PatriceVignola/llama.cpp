@@ -894,10 +894,30 @@ static std::unique_ptr<DmlDequantizeInt6Operator> create_dequantize_int6(uint32_
 static dml::Expression create_rmsnorm(dml::Graph& scope, const std::vector<dml::Expression>& node_inputs, const dml::TensorDesc& output_tensor_desc, float epsilon) {
     GGML_ASSERT(node_inputs.size() == 1);
 
-    std::array<uint32_t, 1> axes = {static_cast<uint32_t>(node_inputs[0].GetOutputDesc().sizes.size() - 1)};
+    auto original_input_sizes = node_inputs[0].GetOutputDesc().sizes;
+
+    // We use those axes and reshape the tensor to better target metacommands
+    std::array<uint32_t, 2> axes = {
+        static_cast<uint32_t>(original_input_sizes.size() - 2),
+        static_cast<uint32_t>(original_input_sizes.size() - 1),
+    };
+
+    auto input = dml::Cast(node_inputs[0], DML_TENSOR_DATA_TYPE_FLOAT16);
+
+    dml::TensorDimensions new_input_sizes({
+        original_input_sizes[1],
+        original_input_sizes[2],
+        original_input_sizes[3],
+        1,
+    });
+
+    input = dml::Reinterpret(input, new_input_sizes, NullOpt);
 
     // The input order in GGML is reversed for MatMul
-    auto result = dml::MeanVarianceNormalization(node_inputs[0], NullOpt, NullOpt, axes, true, false, epsilon);
+    auto result = dml::MeanVarianceNormalization(input, NullOpt, NullOpt, axes, true, false, epsilon);
+
+    result = dml::Cast(result, DML_TENSOR_DATA_TYPE_FLOAT32);
+
     return result;
 }
 

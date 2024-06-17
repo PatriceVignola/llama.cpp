@@ -103,7 +103,7 @@ void DmlDequantizeInt6Operator::RecordDispatch(
 void DmlDequantizeInt6Operator::UpdateBindings(
     ID3D12Device* d3d12Device,
     void** raw_input_data,
-    void* raw_output_data,
+    void** raw_output_data,
     const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
     const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions)
 {
@@ -112,7 +112,7 @@ void DmlDequantizeInt6Operator::UpdateBindings(
 
     m_raw_input_data[0] = raw_input_data[0];
     m_raw_input_data[1] = raw_input_data[1];
-    m_raw_output_data = raw_output_data;
+    m_raw_output_data = raw_output_data[0];
 
     constexpr size_t block_size_without_scale = sizeof(block_q6_K) - sizeof(ggml_fp16_t);
 

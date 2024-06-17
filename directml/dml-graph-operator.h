@@ -13,7 +13,15 @@ using Microsoft::WRL::ComPtr;
 class DmlGraphOperator : public DmlOperator
 {
 public:
-    DmlGraphOperator(dml::Graph& scope, dml::Expression expression, ID3D12Device* d3d12_device, IDMLDevice* dml_device, IDMLCommandRecorder* command_recorder, Dml::ExecutionContext* executionContext, Dml::DmlGpuAllocator& allocator);
+    DmlGraphOperator(
+        dml::Graph& scope,
+        dml::Span<const dml::Expression> expressions,
+        ID3D12Device* d3d12_device,
+        IDMLDevice* dml_device,
+        IDMLCommandRecorder* command_recorder,
+        Dml::ExecutionContext* executionContext,
+        Dml::DmlGpuAllocator& allocator);
+
     void RecordDispatch(
         ID3D12GraphicsCommandList* command_list,
         const Dml::D3D12BufferRegion& temporary_buffer_region) final;
@@ -21,7 +29,7 @@ public:
     void UpdateBindings(
         ID3D12Device* d3d12Device,
         void** raw_input_data,
-        void* raw_output_data,
+        void** raw_output_data,
         const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
         const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions) final;
 
@@ -33,7 +41,13 @@ public:
         return m_raw_input_data[index];
     }
 
-    const void* GetRawOutputData() const final { return m_raw_output_data; }
+    const void* GetRawOutputData(int index) const final {
+        if (index >= m_raw_output_data.size()) {
+            return nullptr;
+        }
+        
+        return m_raw_output_data[index];
+    }
 
     uint64_t GetTemporaryResourceSize() const final { return m_compiledOp->GetBindingProperties().TemporaryResourceSize; }
 
@@ -52,5 +66,5 @@ private:
     Optional<Dml::DmlBuffer> m_persistentBuffer;
     DML_BINDING_TABLE_DESC m_binding_table_desc {};
     std::vector<void*> m_raw_input_data;
-    void* m_raw_output_data = nullptr;
+    std::vector<void*> m_raw_output_data;
 };

@@ -131,7 +131,7 @@ void DmlCopyOperator::RecordDispatch(
 void DmlCopyOperator::UpdateBindings(
     ID3D12Device* d3d12Device,
     void** raw_input_data,
-    void* raw_output_data,
+    void** raw_output_data,
     const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
     const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions)
 {
@@ -139,7 +139,7 @@ void DmlCopyOperator::UpdateBindings(
     assert(output_buffer_regions.size() == 1);
 
     m_raw_input_data = raw_input_data[0];
-    m_raw_output_data = raw_output_data;
+    m_raw_output_data = raw_output_data[0];
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC input_uav_desc = {};
     input_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;

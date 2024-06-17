@@ -5,7 +5,7 @@
 
 DmlGraphOperator::DmlGraphOperator(
     dml::Graph& scope,
-    dml::Expression expression,
+    dml::Span<const dml::Expression> expressions,
     ID3D12Device* d3d12_device,
     IDMLDevice* dml_device,
     IDMLCommandRecorder* command_recorder,
@@ -13,7 +13,7 @@ DmlGraphOperator::DmlGraphOperator(
     Dml::DmlGpuAllocator& allocator
 ) {
     // TODO (pavignol): Add fp16 compute flag
-    m_compiledOp = scope.Compile(DML_EXECUTION_FLAG_DESCRIPTORS_VOLATILE, {expression});
+    m_compiledOp = scope.Compile(DML_EXECUTION_FLAG_DESCRIPTORS_VOLATILE, expressions);
     m_dmlCommandRecorder = command_recorder;
 
     DML_BINDING_PROPERTIES binding_props = m_compiledOp->GetBindingProperties();
@@ -87,7 +87,7 @@ void DmlGraphOperator::RecordDispatch(
 void DmlGraphOperator::UpdateBindings(
     ID3D12Device* d3d12Device,
     void** raw_input_data,
-    void* raw_output_data,
+    void** raw_output_data,
     const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
     const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions)
 {
@@ -97,8 +97,11 @@ void DmlGraphOperator::UpdateBindings(
         m_raw_input_data[i] = raw_input_data[i];
     }
 
-    assert(output_buffer_regions.size() == 1);
-    m_raw_output_data = raw_output_data;
+    m_raw_output_data.resize(output_buffer_regions.size());
+
+    for (int i = 0; i < output_buffer_regions.size(); ++i) {
+        m_raw_output_data[i] = raw_output_data[i];
+    }
 
     auto FillBindingsFromBuffers = [](auto& bufferBindings, auto& bindingDescs, const std::vector<Dml::D3D12BufferRegion>& bufferRegions)
     {

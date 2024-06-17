@@ -28,7 +28,7 @@ public:
     void UpdateBindings(
         ID3D12Device* d3d12Device,
         void** raw_input_data,
-        void* raw_output_data,
+        void** raw_output_data,
         const std::vector<Dml::D3D12BufferRegion>& input_buffer_regions,
         const std::vector<Dml::D3D12BufferRegion>& output_buffer_regions
     ) final {
@@ -39,7 +39,7 @@ public:
         THROW_HR(E_NOTIMPL);
     }
 
-    const void* GetRawOutputData() const final {
+    const void* GetRawOutputData(int index) const final {
         THROW_HR(E_NOTIMPL);
     }
 

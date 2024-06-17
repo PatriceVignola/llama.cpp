@@ -372,6 +372,33 @@ static const char * ggml_backend_directml_name(ggml_backend_t backend) {
     return ctx->name.c_str();
 }
 
+enum class dml_fusion_type {
+    group_query_attention,
+};
+
+struct dml_fusion {
+    dml_fusion(dml_fusion_type type) : type(type) {}
+    virtual ~dml_fusion() = default;
+    dml_fusion_type type;
+};
+
+struct dml_gqa_fusion : public dml_fusion {
+    dml_gqa_fusion() : dml_fusion(dml_fusion_type::group_query_attention) {}
+
+    ggml_tensor* query_tensor;
+    ggml_tensor* key_tensor;
+    ggml_tensor* value_tensor;
+    ggml_tensor* mask_tensor;
+    ggml_tensor* output_tensor;
+    ggml_tensor* present_key_tensor;
+    ggml_tensor* present_value_tensor;
+    float scale;
+};
+
+struct ggml_tensor_extra_directml {
+    std::unique_ptr<dml_fusion> fusion;
+};
+
 struct ggml_backend_directml_buffer_type_context {
     int         device;
     uint64_t    buffer_alignment;
@@ -397,26 +424,33 @@ public:
 
 static directml_manager directmlManager;
 
-struct ggml_directml_memory {
+struct ggml_backend_directml_buffer_context {
     void* data;
     size_t size = 0;
+    std::vector<std::unique_ptr<ggml_tensor_extra_directml>> extras;
 
-    ggml_directml_memory() = default;
-    ggml_directml_memory(ggml_directml_memory&& other) {
+    ggml_backend_directml_buffer_context() = default;
+    ggml_backend_directml_buffer_context(ggml_backend_directml_buffer_context&& other) {
         data = other.data;
         size = other.size;
+        extras = std::move(other.extras);
         other.data = nullptr;
     }
 
-    ~ggml_directml_memory() {
+    ~ggml_backend_directml_buffer_context() {
         if (s_directml_context && data) {
             s_directml_context->allocator->Free(data);
         }
     }
+
+    ggml_tensor_extra_directml* allocate_extra() {
+        extras.emplace_back(std::make_unique<ggml_tensor_extra_directml>());
+        return extras.back().get();
+    }
 };
 
-static ggml_directml_memory ggml_directml_allocate(size_t size) {
-    ggml_directml_memory memory;
+static ggml_backend_directml_buffer_context ggml_directml_allocate(size_t size) {
+    ggml_backend_directml_buffer_context memory;
     memory.data = s_directml_context->allocator->Alloc(size);
     memory.size = size;
 
@@ -435,12 +469,12 @@ static const char * ggml_backend_directml_buffer_get_name(ggml_backend_buffer_t 
 }
 
 static void ggml_backend_directml_buffer_free_buffer(ggml_backend_buffer_t buffer) {
-    auto * memory = (ggml_directml_memory *)buffer->context;
+    auto * memory = (ggml_backend_directml_buffer_context *)buffer->context;
     delete memory;
 }
 
 static void * ggml_backend_directml_buffer_get_base(ggml_backend_buffer_t buffer) {
-    return ((ggml_directml_memory *)buffer->context)->data;
+    return ((ggml_backend_directml_buffer_context *)buffer->context)->data;
 }
 
 static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * srcData, size_t offset, size_t size) {
@@ -597,7 +631,7 @@ static void ggml_backend_directml_buffer_get_tensor(ggml_backend_buffer_t buffer
 }
 
 static void ggml_backend_directml_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
-    auto* tensor = (ggml_directml_memory *)buffer->context;
+    auto* tensor = (ggml_backend_directml_buffer_context *)buffer->context;
 
     auto bufferRegion = s_directml_context->allocator->CreateBufferRegion(tensor->data, tensor->size);
     ID3D12Resource* dstData = bufferRegion.GetD3D12Resource();
@@ -607,6 +641,9 @@ static void ggml_backend_directml_buffer_clear(ggml_backend_buffer_t buffer, uin
 
 static void ggml_backend_directml_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     tensor->backend = GGML_BACKEND_TYPE_GPU;
+
+    auto* ctx = static_cast<ggml_backend_directml_buffer_context*>(buffer->context);
+    tensor->extra = ctx->allocate_extra();
 }
 
 static ggml_backend_buffer_i ggml_backend_directml_buffer_i = {
@@ -626,7 +663,7 @@ static ggml_backend_buffer_t ggml_backend_directml_buffer_type_alloc_buffer(ggml
         s_directml_context = new ggml_directml_context(0);
     }
 
-    auto * ctx = new ggml_directml_memory(ggml_directml_allocate(size));
+    auto * ctx = new ggml_backend_directml_buffer_context(ggml_directml_allocate(size));
     return ggml_backend_buffer_init(buft, ggml_backend_directml_buffer_i, ctx, size);
 }
 
@@ -1123,6 +1160,76 @@ static std::tuple<dml::Expression, dml::Expression> generate_cos_sin_caches(
     return std::make_tuple(cos_cache, sin_cache);
 }
 
+static std::tuple<dml::Expression, dml::Expression, dml::Expression> create_gqa(
+    dml::Graph& scope,
+    dml_gqa_fusion* gqa_fusion
+) {
+    auto query_tensor_desc = ggml_to_dml_tensor_desc(gqa_fusion->query_tensor);
+    auto key_tensor_desc = ggml_to_dml_tensor_desc(gqa_fusion->key_tensor);
+    auto value_tensor_desc = ggml_to_dml_tensor_desc(gqa_fusion->value_tensor);
+    auto mask_tensor_desc = ggml_to_dml_tensor_desc(gqa_fusion->mask_tensor);
+
+    const uint32_t batch_size = query_tensor_desc.sizes[query_tensor_desc.sizes.size() - 4];
+    const uint32_t sequence_length = query_tensor_desc.sizes[query_tensor_desc.sizes.size() - 3];
+    const uint32_t query_head_count = query_tensor_desc.sizes[query_tensor_desc.sizes.size() - 2];
+    const uint32_t key_value_head_count = key_tensor_desc.sizes[key_tensor_desc.sizes.size() - 2];
+    const uint32_t head_size = query_tensor_desc.sizes[query_tensor_desc.sizes.size() - 1];
+    const uint32_t hidden_size = query_head_count * head_size;
+    const uint32_t key_value_sequence_length = key_tensor_desc.sizes[query_tensor_desc.sizes.size() - 3];
+    const uint32_t value_hidden_size = value_tensor_desc.sizes[value_tensor_desc.sizes.size() - 1];
+    const uint32_t max_sequence_length = mask_tensor_desc.sizes[mask_tensor_desc.sizes.size() - 1];
+
+    dml::TensorDimensions query_sizes({batch_size, sequence_length, hidden_size});
+    auto query_tensor = dml::InputTensor(scope, 0, query_tensor_desc);
+    query_tensor = dml::Reinterpret(query_tensor, query_sizes, NullOpt);
+
+    dml::TensorDimensions key_sizes({batch_size, key_value_sequence_length, hidden_size});
+    auto key_tensor = dml::InputTensor(scope, 1, key_tensor_desc);
+    key_tensor = dml::Reinterpret(key_tensor, key_sizes, NullOpt);
+
+    dml::TensorDimensions value_sizes({batch_size, key_value_sequence_length, value_hidden_size});
+    auto value_tensor = dml::InputTensor(scope, 2, value_tensor_desc);
+    value_tensor = dml::Reinterpret(value_tensor, value_sizes, NullOpt);
+
+    dml::Expression past_sequence_lengths_tensor;
+
+    if (sequence_length == 1) {
+        auto mask_tensor = dml::InputTensor(scope, 3, mask_tensor_desc);
+        mask_tensor = -dml::Sign(mask_tensor), DML_TENSOR_DATA_TYPE_INT32;
+
+        std::array<uint32_t, 1> axes = {static_cast<uint32_t>(mask_tensor_desc.sizes.size() - 1)};
+        past_sequence_lengths_tensor = dml::Reduce(mask_tensor, DML_REDUCE_FUNCTION_SUM, axes, mask_tensor_desc.dataType);
+        past_sequence_lengths_tensor = dml::Cast(past_sequence_lengths_tensor, DML_TENSOR_DATA_TYPE_INT32);
+        past_sequence_lengths_tensor = dml::Reinterpret(past_sequence_lengths_tensor, {batch_size}, NullOpt);
+    } else {
+        past_sequence_lengths_tensor = dml::FillValueConstant(scope, {batch_size}, DML_TENSOR_DATA_TYPE_INT32, DML_SCALAR_UNION{});
+    }
+
+    auto result = dml::MultiHeadAttention(
+        query_tensor,
+        key_tensor,
+        value_tensor,
+        NullOpt,
+        NullOpt,
+        NullOpt,
+        NullOpt,
+        NullOpt,
+        NullOpt,
+        NullOpt,
+        NullOpt,
+        past_sequence_lengths_tensor,
+        gqa_fusion->scale,
+        std::numeric_limits<float>::lowest(),
+        query_head_count,
+        key_value_head_count,
+        DML_MULTIHEAD_ATTENTION_MASK_TYPE_NONE,
+        true,
+        max_sequence_length
+    );
+
+    return std::make_tuple(result.output, *result.outputPresentKey, *result.outputPresentValue);
+}
+
 static dml::Expression create_rope(
     dml::Graph& scope,
     const std::vector<dml::Expression>& node_inputs,
@@ -1367,11 +1474,80 @@ static void update_bindings(ggml_cgraph* cgraph) {
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         auto node = cgraph->nodes[node_index];
 
+        if (node->backend != GGML_BACKEND_TYPE_GPU) {
+            continue;
+        }
+
+        auto node_extra = static_cast<ggml_tensor_extra_directml*>(node->extra);
+
+        if (node_extra->fusion) {
+            switch (node_extra->fusion->type) {
+            case dml_fusion_type::group_query_attention:
+            {
+                auto fusion = static_cast<dml_gqa_fusion*>(node_extra->fusion.get());
+                bool same_query_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == fusion->query_tensor;
+                bool same_key_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(1) == fusion->key_tensor;
+                bool same_value_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(2) == fusion->value_tensor;
+
+                auto sequence_length = fusion->query_tensor->ne[2];
+                bool same_mask_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(3) == fusion->mask_tensor;
+                bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == fusion->output_tensor;
+                bool same_output_present_key_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(1) == fusion->present_key_tensor;
+                bool same_output_present_value_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(2) == fusion->present_value_tensor;
+
+                if (!same_query_data || !same_key_data || !same_value_data || !same_mask_data || !same_output_data || !same_output_present_key_data || !same_output_present_value_data) {
+                    std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
+                        s_directml_context->allocator->CreateBufferRegion(fusion->query_tensor->data, ggml_to_dml_tensor_desc(fusion->query_tensor).totalTensorSizeInBytes),
+                        s_directml_context->allocator->CreateBufferRegion(fusion->key_tensor->data, ggml_to_dml_tensor_desc(fusion->key_tensor).totalTensorSizeInBytes),
+                        s_directml_context->allocator->CreateBufferRegion(fusion->value_tensor->data, ggml_to_dml_tensor_desc(fusion->value_tensor).totalTensorSizeInBytes),
+                    });
+
+                    if (sequence_length == 1) {
+                        input_buffer_regions.push_back(
+                            s_directml_context->allocator->CreateBufferRegion(fusion->mask_tensor->data, ggml_to_dml_tensor_desc(fusion->mask_tensor).totalTensorSizeInBytes)
+                        );
+                    }
+
+                    std::vector<Dml::D3D12BufferRegion> output_buffer_regions({
+                        s_directml_context->allocator->CreateBufferRegion(fusion->output_tensor->data, ggml_to_dml_tensor_desc(fusion->output_tensor).totalTensorSizeInBytes),
+                        s_directml_context->allocator->CreateBufferRegion(fusion->present_key_tensor->data, ggml_to_dml_tensor_desc(fusion->present_key_tensor).totalTensorSizeInBytes),
+                        s_directml_context->allocator->CreateBufferRegion(fusion->present_value_tensor->data, ggml_to_dml_tensor_desc(fusion->present_value_tensor).totalTensorSizeInBytes),
+                    });
+
+                    std::array<void*, 4> src_data = {
+                        fusion->query_tensor->data,
+                        fusion->key_tensor->data,
+                        fusion->value_tensor->data,
+                        fusion->mask_tensor->data,
+                    };
+
+                    std::array<void*, 3> dst_data = {
+                        fusion->output_tensor->data,
+                        fusion->present_key_tensor->data,
+                        fusion->present_value_tensor->data,
+                    };
+
+                    s_directml_context->reused_command_list_state.operators[dml_operator_index]->UpdateBindings(
+                        s_directml_context->d3d12_device.Get(),
+                        src_data.data(),
+                        dst_data.data(),
+                        input_buffer_regions,
+                        output_buffer_regions
+                    );
+                }
+
+                ++dml_operator_index;
+                continue;
+            }
+            default: THROW_HR(E_NOTIMPL);
+            }
+        }
+
         switch (node->op) {
             case GGML_OP_RMS_NORM:
                 {
                     bool same_input_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == node->src[0]->data;
-                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData() == node->data;
+                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == node->data;
 
                     if (!same_input_data || !same_output_data) {
                         std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
@@ -1384,7 +1560,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                         s_directml_context->reused_command_list_state.operators[dml_operator_index]->UpdateBindings(
                             s_directml_context->d3d12_device.Get(),
                             &node->src[0]->data,
-                            node->data,
+                            &node->data,
                             input_buffer_regions,
                             output_buffer_regions
                         );
@@ -1398,7 +1574,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                     if (node->src[0]->type == GGML_TYPE_Q6_K) {
                         bool same_a_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == node->src[0]->data;
                         bool same_b_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(1) == node->src[1]->data;
-                        bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData() == node->data;
+                        bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == node->data;
 
                         if (!same_a_data || !same_b_data || !same_output_data) {
                             const auto dequantized_tensor_sizes = ggml_to_dml_sizes(node->src[0]);
@@ -1427,7 +1603,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                             s_directml_context->reused_command_list_state.operators[dml_operator_index]->UpdateBindings(
                                 s_directml_context->d3d12_device.Get(),
                                 src_data.data(),
-                                node->data,
+                                &node->data,
                                 dequantize_input_buffer_regions,
                                 dequantize_output_buffer_regions
                             );
@@ -1446,7 +1622,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                             s_directml_context->reused_command_list_state.operators[dml_operator_index + 1]->UpdateBindings(
                                 s_directml_context->d3d12_device.Get(),
                                 src_data.data(),
-                                node->data,
+                                &node->data,
                                 matmul_input_buffer_regions,
                                 matmul_output_buffer_regions
                             );
@@ -1456,7 +1632,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                     } else if (ggml_is_quantized(node->src[0]->type)) {
                         bool same_a_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == node->src[0]->data;
                         bool same_b_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(1) == node->src[1]->data;
-                        bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData() == node->data;
+                        bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == node->data;
 
                         if (!same_a_data || !same_b_data || !same_output_data) {
                             auto quantized_tensor_sizes = ggml_to_dml_sizes(node->src[0]);
@@ -1488,7 +1664,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                             s_directml_context->reused_command_list_state.operators[dml_operator_index]->UpdateBindings(
                                 s_directml_context->d3d12_device.Get(),
                                 src_data.data(),
-                                node->data,
+                                &node->data,
                                 input_buffer_regions,
                                 output_buffer_regions
                             );
@@ -1498,7 +1674,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                     } else {
                         bool same_a_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == node->src[0]->data;
                         bool same_b_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(1) == node->src[1]->data;
-                        bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData() == node->data;
+                        bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == node->data;
 
                         if (!same_a_data || !same_b_data || !same_output_data) {
                             std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
@@ -1517,7 +1693,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                             s_directml_context->reused_command_list_state.operators[dml_operator_index]->UpdateBindings(
                                 s_directml_context->d3d12_device.Get(),
                                 src_data.data(),
-                                node->data,
+                                &node->data,
                                 input_buffer_regions,
                                 output_buffer_regions
                             );
@@ -1531,7 +1707,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                 {
                     bool same_a_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == node->src[0]->data;
                     bool same_b_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(1) == node->src[1]->data;
-                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData() == node->data;
+                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == node->data;
 
                     if (!same_a_data || !same_b_data || !same_output_data) {
                         std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
@@ -1550,7 +1726,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                         s_directml_context->reused_command_list_state.operators[dml_operator_index]->UpdateBindings(
                             s_directml_context->d3d12_device.Get(),
                             src_data.data(),
-                            node->data,
+                            &node->data,
                             input_buffer_regions,
                             output_buffer_regions
                         );
@@ -1563,7 +1739,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                 {
                     bool same_a_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == node->src[0]->data;
                     bool same_b_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(1) == node->src[1]->data;
-                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData() == node->data;
+                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == node->data;
 
                     if (!same_a_data || !same_b_data || !same_output_data) {
                         std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
@@ -1582,7 +1758,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                         s_directml_context->reused_command_list_state.operators[dml_operator_index]->UpdateBindings(
                             s_directml_context->d3d12_device.Get(),
                             src_data.data(),
-                            node->data,
+                            &node->data,
                             input_buffer_regions,
                             output_buffer_regions
                         );
@@ -1595,7 +1771,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
             case GGML_OP_CONT:
                 {
                     bool same_input_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == node->src[0]->data;
-                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData() == node->data;
+                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == node->data;
 
                     if (!same_input_data || !same_output_data) {
                         std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
@@ -1608,7 +1784,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                         s_directml_context->reused_command_list_state.operators[dml_operator_index]->UpdateBindings(
                             s_directml_context->d3d12_device.Get(),
                             &node->src[0]->data,
-                            node->data,
+                            &node->data,
                             input_buffer_regions,
                             output_buffer_regions
                         );
@@ -1621,7 +1797,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                 {
                     bool same_a_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == node->src[0]->data;
                     bool same_b_data = !node->src[1] || s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(1) == node->src[1]->data;
-                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData() == node->data;
+                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == node->data;
 
                     if (!same_a_data || !same_b_data || !same_output_data) {
                         std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
@@ -1643,7 +1819,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                         s_directml_context->reused_command_list_state.operators[dml_operator_index]->UpdateBindings(
                             s_directml_context->d3d12_device.Get(),
                             src_data.data(),
-                            node->data,
+                            &node->data,
                             input_buffer_regions,
                             output_buffer_regions
                         );
@@ -1656,7 +1832,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                 {
                     bool same_a_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == node->src[0]->data;
                     bool same_b_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(1) == node->src[1]->data;
-                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData() == node->data;
+                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == node->data;
 
                     if (!same_a_data || !same_b_data || !same_output_data) {
                         std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
@@ -1675,7 +1851,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                         s_directml_context->reused_command_list_state.operators[dml_operator_index]->UpdateBindings(
                             s_directml_context->d3d12_device.Get(),
                             src_data.data(),
-                            node->data,
+                            &node->data,
                             input_buffer_regions,
                             output_buffer_regions
                         );
@@ -1687,7 +1863,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
             case GGML_OP_UNARY:
                 {
                     bool same_input_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == node->src[0]->data;
-                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData() == node->data;
+                    bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == node->data;
 
                     if (!same_input_data || !same_output_data) {
                         std::vector<Dml::D3D12BufferRegion> input_buffer_regions({
@@ -1700,7 +1876,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                         s_directml_context->reused_command_list_state.operators[dml_operator_index]->UpdateBindings(
                             s_directml_context->d3d12_device.Get(),
                             &node->src[0]->data,
-                            node->data,
+                            &node->data,
                             input_buffer_regions,
                             output_buffer_regions
                         );
@@ -1719,6 +1895,129 @@ static void update_bindings(ggml_cgraph* cgraph) {
             default:
                 THROW_HR(E_NOTIMPL);
         }
+    }
+}
+
+static void fuse_gqa(ggml_tensor* node, struct ggml_cgraph * cgraph) {
+    if (node->op != GGML_OP_PERMUTE) {
+        return;
+    }
+
+    if (node->src[0]->op != GGML_OP_MUL_MAT) {
+        return;
+    }
+
+    auto qkv_matmul_node = node->src[0];
+    if (qkv_matmul_node->src[1]->op != GGML_OP_SOFT_MAX) {
+        return;
+    }
+
+    auto softmax_node = qkv_matmul_node->src[1];
+    if (!softmax_node->src[1]) {
+        return;
+    }
+
+    if (softmax_node->src[0]->op != GGML_OP_MUL_MAT) {
+        return;
+    }
+
+    auto qk_matmul_node = softmax_node->src[0];
+    if (qk_matmul_node->src[1]->op != GGML_OP_PERMUTE) {
+        return;
+    }
+
+    if (qkv_matmul_node->src[0]->op != GGML_OP_VIEW) {
+        return;
+    }
+
+    if (qk_matmul_node->src[0]->op != GGML_OP_VIEW) {
+        return;
+    }
+
+    auto query_permute_node = qk_matmul_node->src[1];
+    if (query_permute_node->src[0]->op != GGML_OP_ROPE) {
+        return;
+    }
+
+    auto query_tensor = query_permute_node->src[0];
+    auto key_cache_tensor = qk_matmul_node->src[0]->src[0];
+    auto value_cache_tensor = qkv_matmul_node->src[0]->src[0];
+    auto mask_tensor = softmax_node->src[1];
+
+    ggml_tensor* key_copy_node = nullptr;
+    ggml_tensor* value_copy_node = nullptr;
+    ggml_tensor* key_tensor = nullptr;
+    ggml_tensor* value_tensor = nullptr;
+    ggml_tensor* value_transpose_node = nullptr;
+
+    for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
+        auto other_node = cgraph->nodes[node_index];
+
+        if (other_node->op == GGML_OP_CPY) {
+            if (other_node->src[1]->op != GGML_OP_VIEW) {
+                continue;
+            }
+
+            if (key_cache_tensor == other_node->src[1]->src[0] && other_node->src[0]->op == GGML_OP_ROPE) {
+                key_copy_node = other_node;
+                key_tensor = other_node->src[0];
+            } else if (value_cache_tensor == other_node->src[1]->src[0] && other_node->src[0]->op == GGML_OP_TRANSPOSE) {
+                value_copy_node = other_node;
+                value_transpose_node = other_node->src[0];
+                value_tensor = other_node->src[0]->src[0];
+            } else {
+                continue;
+            }
+        }
+
+        // If both the key and value tensors were found, we can end early
+        if (key_tensor && value_tensor) {
+            break;
+        }
+    }
+
+    if (!key_tensor || !value_tensor) {
+        return;
+    }
+
+    std::array<int32_t, 4> expected_permutations = {0, 2, 1, 3};
+    if (!std::equal(expected_permutations.begin(), expected_permutations.end(), node->op_params)) {
+        return;
+    }
+
+    if (!std::equal(expected_permutations.begin(), expected_permutations.end(), query_permute_node->op_params)) {
+        return;
+    }
+
+    // TODO (pavignol): Validate dimensions
+
+    // Remove the intermediate nodes
+    qk_matmul_node->op = GGML_OP_NONE;
+    softmax_node->op = GGML_OP_NONE;
+    qkv_matmul_node->op = GGML_OP_NONE;
+    key_copy_node->op = GGML_OP_NONE;
+    value_copy_node->op = GGML_OP_NONE;
+    query_permute_node->op = GGML_OP_NONE;
+    value_transpose_node->op = GGML_OP_NONE;
+    node->op = GGML_OP_NONE;
+
+    auto output_node_extra = static_cast<ggml_tensor_extra_directml*>(node->extra);
+    auto gqa_fusion = std::make_unique<dml_gqa_fusion>();
+    gqa_fusion->query_tensor = query_tensor;
+    gqa_fusion->key_tensor = key_tensor;
+    gqa_fusion->value_tensor = value_tensor;
+    gqa_fusion->mask_tensor = mask_tensor;
+    gqa_fusion->output_tensor = node;
+    gqa_fusion->present_key_tensor = key_cache_tensor;
+    gqa_fusion->present_value_tensor = value_cache_tensor;
+    memcpy(&gqa_fusion->scale, softmax_node->op_params, sizeof(float));
+    output_node_extra->fusion = std::move(gqa_fusion);
+}
+
+static void fuse_patterns(struct ggml_cgraph * cgraph) {
+    for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
+        auto node = cgraph->nodes[node_index];
+        fuse_gqa(node, cgraph);
     }
 }
 
@@ -1788,14 +2087,54 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
     auto uav_barrier = CD3DX12_RESOURCE_BARRIER::UAV(nullptr);
     s_directml_context->reused_command_list_state.command_list->ResourceBarrier(1, &uav_barrier);
 
+    // Perform the fusions
+    fuse_patterns(cgraph);
+
     for (int node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
         auto node = cgraph->nodes[node_index];
+
+        if (node->backend != GGML_BACKEND_TYPE_GPU) {
+            continue;
+        }
+
         auto scope = dml::Graph(s_directml_context->dml_device.Get());
 
         std::vector<dml::TensorDesc> input_tensors;
         std::vector<dml::Expression> node_inputs;
 
         uint32_t dml_index = 0;
+
+        auto node_extra = static_cast<ggml_tensor_extra_directml*>(node->extra);
+
+        if (node_extra->fusion) {
+            switch (node_extra->fusion->type) {
+            case dml_fusion_type::group_query_attention:
+            {
+                auto fusion = static_cast<dml_gqa_fusion*>(node_extra->fusion.get());
+                dml::Expression output, output_present_key, output_present_value;
+                std::tie(output, output_present_key, output_present_value) = create_gqa(scope, fusion);
+                std::array<dml::Expression, 3> expressions = {output, output_present_key, output_present_value};
+
+                auto dml_op = std::make_unique<DmlGraphOperator>(
+                    scope,
+                    expressions,
+                    s_directml_context->d3d12_device.Get(),
+                    s_directml_context->dml_device.Get(),
+                    s_directml_context->dml_recorder.Get(),
+                    s_directml_context->execution_context.get(),
+                    *s_directml_context->allocator
+                );
+
+                // TODO (pavignol): Make sure the key captures all nodes (query/key/value/mask)
+                // Cache the operator and its key in the command list state
+                s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
+                s_directml_context->reused_command_list_state.keys.push_back(make_node_key(node));
+                continue;
+            }
+                break;
+            default: THROW_HR(E_NOTIMPL);
+            }
+        }
 
         for (int src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
             if (!node->src[src_index] || (node->op == GGML_OP_CPY && src_index == 1)) {
@@ -1831,7 +2170,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                 {
                     float epsilon;
                     memcpy(&epsilon, node->op_params, sizeof(float));
-                    auto result = create_rmsnorm(scope, node_inputs, dml_output_desc, epsilon);
+                    std::array<dml::Expression, 1> result = {create_rmsnorm(scope, node_inputs, dml_output_desc, epsilon)};
                     auto dml_op = std::make_unique<DmlGraphOperator>(
                         scope,
                         result,
@@ -1861,7 +2200,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                             dml::InputTensor(scope, 0, dequantized_tensor_desc),
                             dml::InputTensor(scope, 1, ggml_to_dml_tensor_desc(node->src[1])),
                         };
-                        auto result = create_matmul(scope, matmul_inputs, dml_output_desc);
+                        std::array<dml::Expression, 1> result = {create_matmul(scope, matmul_inputs, dml_output_desc)};
                         auto matmul_op = std::make_unique<DmlGraphOperator>(
                             scope,
                             result,
@@ -1903,7 +2242,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                             THROW_HR(E_NOTIMPL);
                         }
 
-                        auto result = create_quantized_matmul(scope, node_inputs, dml_output_desc, quantization_type);
+                        std::array<dml::Expression, 1> result = {create_quantized_matmul(scope, node_inputs, dml_output_desc, quantization_type)};
                         auto dml_op = std::make_unique<DmlGraphOperator>(
                             scope,
                             result,
@@ -1918,7 +2257,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                         s_directml_context->reused_command_list_state.operators.push_back(std::move(dml_op));
                         s_directml_context->reused_command_list_state.keys.push_back(make_node_key(node));
                     } else {
-                        auto result = create_matmul(scope, node_inputs, dml_output_desc);
+                        std::array<dml::Expression, 1> result = {create_matmul(scope, node_inputs, dml_output_desc)};
                         auto dml_op = std::make_unique<DmlGraphOperator>(
                             scope,
                             result,
@@ -1937,7 +2276,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                 break;
             case GGML_OP_MUL:
                 {
-                    auto result = create_multiply(scope, node_inputs, dml_output_desc);
+                    std::array<dml::Expression, 1> result = {create_multiply(scope, node_inputs, dml_output_desc)};
                     auto dml_op = std::make_unique<DmlGraphOperator>(
                         scope,
                         result,
@@ -1971,7 +2310,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     memcpy(&beta_slow,   (int32_t *) node->op_params + 10, sizeof(float));
                     memcpy(&xpos_base,   (int32_t *) node->op_params + 11, sizeof(float));
                     memcpy(&xpos_down,   (int32_t *) node->op_params + 12, sizeof(bool));
-                    auto result = create_rope(scope, node_inputs, dml_output_desc, mode, n_dims, freq_base, freq_scale, n_orig_ctx, ext_factor, attn_factor, beta_fast, beta_slow, xpos_base, xpos_down);
+                    std::array<dml::Expression, 1> result = {create_rope(scope, node_inputs, dml_output_desc, mode, n_dims, freq_base, freq_scale, n_orig_ctx, ext_factor, attn_factor, beta_fast, beta_slow, xpos_base, xpos_down)};
 
                     auto dml_op = std::make_unique<DmlGraphOperator>(
                         scope,
@@ -2004,7 +2343,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                     memcpy(&scale, node->op_params, sizeof(float));
                     float max_bias;
                     memcpy(&max_bias, (float *) node->op_params + 1, sizeof(float));
-                    auto result = create_softmax(scope, node_inputs, dml_output_desc, scale, max_bias);
+                    std::array<dml::Expression, 1> result = {create_softmax(scope, node_inputs, dml_output_desc, scale, max_bias)};
                     auto dml_op = std::make_unique<DmlGraphOperator>(
                         scope,
                         result,
@@ -2022,7 +2361,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                 break;
             case GGML_OP_ADD:
                 {
-                    auto result = create_add(scope, node_inputs, dml_output_desc);
+                    std::array<dml::Expression, 1> result = {create_add(scope, node_inputs, dml_output_desc)};
                     auto dml_op = std::make_unique<DmlGraphOperator>(
                         scope,
                         result,
@@ -2040,42 +2379,42 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                 break;
             case GGML_OP_UNARY:
                 {
-                    dml::Expression result;
+                    std::array<dml::Expression, 1> result;
 
                     switch (ggml_get_unary_op(node)) {
                     case GGML_UNARY_OP_RELU:
-                        result = create_relu(scope, node_inputs, dml_output_desc);
+                        result = {create_relu(scope, node_inputs, dml_output_desc)};
                         break;
                     case GGML_UNARY_OP_GELU_QUICK:
                     case GGML_UNARY_OP_GELU:
-                        result = create_gelu(scope, node_inputs, dml_output_desc);
+                        result = {create_gelu(scope, node_inputs, dml_output_desc)};
                         break;
                     case GGML_UNARY_OP_SILU:
-                        result = create_silu(scope, node_inputs, dml_output_desc);
+                        result = {create_silu(scope, node_inputs, dml_output_desc)};
                         break;
                     case GGML_UNARY_OP_ABS:
-                        result = create_abs(scope, node_inputs, dml_output_desc);
+                        result = {create_abs(scope, node_inputs, dml_output_desc)};
                         break;
                     case GGML_UNARY_OP_NEG:
-                        result = create_neg(scope, node_inputs, dml_output_desc);
+                        result = {create_neg(scope, node_inputs, dml_output_desc)};
                         break;
                     case GGML_UNARY_OP_TANH:
-                        result = create_tanh(scope, node_inputs, dml_output_desc);
+                        result = {create_tanh(scope, node_inputs, dml_output_desc)};
                         break;
                     case GGML_UNARY_OP_ELU:
-                        result = create_elu(scope, node_inputs, dml_output_desc);
+                        result = {create_elu(scope, node_inputs, dml_output_desc)};
                         break;
                     case GGML_UNARY_OP_HARDSIGMOID:
-                        result = create_hardsigmoid(scope, node_inputs, dml_output_desc);
+                        result = {create_hardsigmoid(scope, node_inputs, dml_output_desc)};
                         break;
                     case GGML_UNARY_OP_SGN:
-                        result = create_signum(scope, node_inputs, dml_output_desc);
+                        result = {create_signum(scope, node_inputs, dml_output_desc)};
                         break;
                     case GGML_UNARY_OP_STEP:
-                        result = create_step(scope, node_inputs, dml_output_desc);
+                        result = {create_step(scope, node_inputs, dml_output_desc)};
                         break;
                     case GGML_UNARY_OP_HARDSWISH:
-                        result = create_hardswish(scope, node_inputs, dml_output_desc);
+                        result = {create_hardswish(scope, node_inputs, dml_output_desc)};
                         break;
                     default:
                         THROW_HR(E_NOTIMPL);

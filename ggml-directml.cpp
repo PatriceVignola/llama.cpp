@@ -1899,15 +1899,20 @@ static void update_bindings(ggml_cgraph* cgraph) {
 }
 
 static void fuse_gqa(ggml_tensor* node, struct ggml_cgraph * cgraph) {
-    if (node->op != GGML_OP_PERMUTE) {
+    if (node->op != GGML_OP_CONT) {
         return;
     }
 
-    if (node->src[0]->op != GGML_OP_MUL_MAT) {
+    if (node->src[0]->op != GGML_OP_PERMUTE) {
         return;
     }
 
-    auto qkv_matmul_node = node->src[0];
+    auto output_permute_node = node->src[0];
+    if (output_permute_node->src[0]->op != GGML_OP_MUL_MAT) {
+        return;
+    }
+
+    auto qkv_matmul_node = output_permute_node->src[0];
     if (qkv_matmul_node->src[1]->op != GGML_OP_SOFT_MAX) {
         return;
     }
@@ -1999,6 +2004,7 @@ static void fuse_gqa(ggml_tensor* node, struct ggml_cgraph * cgraph) {
     value_copy_node->op = GGML_OP_NONE;
     query_permute_node->op = GGML_OP_NONE;
     value_transpose_node->op = GGML_OP_NONE;
+    output_permute_node->op = GGML_OP_NONE;
     node->op = GGML_OP_NONE;
 
     auto output_node_extra = static_cast<ggml_tensor_extra_directml*>(node->extra);

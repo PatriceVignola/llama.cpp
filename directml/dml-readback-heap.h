@@ -7,6 +7,7 @@
 #include <vector>
 #include <wrl/client.h>
 #include <d3d12.h>
+#include <functional>
 
 using Microsoft::WRL::ComPtr;
 
@@ -29,7 +30,8 @@ namespace Dml
             uint64_t size,
             ID3D12Resource* src,
             uint64_t srcOffset,
-            D3D12_RESOURCE_STATES srcState);
+            D3D12_RESOURCE_STATES srcState,
+            std::function<void(uint8_t* dstData, const byte* readbackHeapData)> customCopy = nullptr);
 
         // Overload supporting batching
         void ReadbackFromGpu(

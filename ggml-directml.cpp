@@ -398,6 +398,7 @@ struct dml_gqa_fusion : public dml_fusion {
 struct ggml_tensor_extra_directml {
     std::unique_ptr<dml_fusion> fusion;
     bool removed = false;
+    ggml_type real_data_type;
 };
 
 struct ggml_backend_directml_buffer_type_context {
@@ -580,7 +581,22 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
         // Frequently flush when uploading weights to make sure we don't run out of staging memory
         s_directml_context->execution_context->Flush();
     } else if (buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-        s_directml_context->upload_heap.BeginUploadToGpu(dstData, bufferRegion.Offset() + offset, dstState, reinterpret_cast<const uint8_t*>(srcData), size);
+        auto tensor_extra = static_cast<ggml_tensor_extra_directml*>(tensor->extra);
+
+        if (tensor->type == GGML_TYPE_F32 && tensor_extra->real_data_type == GGML_TYPE_F16) {
+            auto preprocess = [size](byte* uploadHeapData, const uint8_t* srcData) {
+                auto dst_bytes = reinterpret_cast<ggml_fp16_t*>(uploadHeapData);
+                auto src_bytes = reinterpret_cast<const float*>(srcData);
+
+                for (int i = 0; i < size / sizeof(float); ++i) {
+                    dst_bytes[i] = GGML_FP32_TO_FP16(src_bytes[i]);
+                }
+            };
+
+            s_directml_context->upload_heap.BeginUploadToGpu(dstData, bufferRegion.Offset() + offset, dstState, reinterpret_cast<const uint8_t*>(srcData), size, preprocess);
+        } else {
+            s_directml_context->upload_heap.BeginUploadToGpu(dstData, bufferRegion.Offset() + offset, dstState, reinterpret_cast<const uint8_t*>(srcData), size);
+        }
 
         // Frequently flush when uploading weights to make sure we don't run out of staging memory
         s_directml_context->execution_context->Flush();
@@ -617,7 +633,20 @@ static void ggml_backend_directml_buffer_set_tensor(ggml_backend_buffer_t buffer
 
         void* uploadHeapData = nullptr;
         THROW_IF_FAILED(iter->second.upload_heap->Map(0, nullptr, &uploadHeapData));
-        memcpy(static_cast<byte*>(uploadHeapData), reinterpret_cast<const uint8_t*>(srcData), size);
+
+        auto tensor_extra = static_cast<ggml_tensor_extra_directml*>(tensor->extra);
+
+        if (tensor->type == GGML_TYPE_F32 && tensor_extra->real_data_type == GGML_TYPE_F16) {
+            auto dst_bytes = reinterpret_cast<ggml_fp16_t*>(uploadHeapData);
+            auto src_bytes = reinterpret_cast<const float*>(srcData);
+
+            for (int i = 0; i < size / sizeof(float); ++i) {
+                dst_bytes[i] = GGML_FP32_TO_FP16(src_bytes[i]);
+            }
+        } else {
+            memcpy(static_cast<byte*>(uploadHeapData), reinterpret_cast<const uint8_t*>(srcData), size);
+        }
+
         iter->second.upload_heap->Unmap(0, nullptr);
     }
 }
@@ -628,7 +657,23 @@ static void ggml_backend_directml_buffer_get_tensor(ggml_backend_buffer_t buffer
 
     const auto srcState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; // GPU resources are always kept in UAV state
     // Performs a blocking call to synchronize and read back data from the GPU into the destination buffer
-    s_directml_context->readback_heap.ReadbackFromGpu(s_directml_context->execution_context.get(), reinterpret_cast<uint8_t*>(dstData), size, srcData, bufferRegion.Offset() + offset, srcState);
+
+    auto tensor_extra = static_cast<ggml_tensor_extra_directml*>(tensor->extra);
+
+    if (tensor->type == GGML_TYPE_F32 && tensor_extra->real_data_type == GGML_TYPE_F16) {
+        auto preprocess = [size](uint8_t* dstData, const byte* readbackHeapData) {
+            auto dst_bytes = reinterpret_cast<float*>(dstData);
+            auto src_bytes = reinterpret_cast<const ggml_fp16_t*>(readbackHeapData);
+
+            for (int i = 0; i < size / sizeof(float); ++i) {
+                dst_bytes[i] = GGML_FP16_TO_FP32(src_bytes[i]);
+            }
+        };
+
+        s_directml_context->readback_heap.ReadbackFromGpu(s_directml_context->execution_context.get(), reinterpret_cast<uint8_t*>(dstData), size / 2, srcData, bufferRegion.Offset() + offset / 2, srcState, preprocess);
+    } else {
+        s_directml_context->readback_heap.ReadbackFromGpu(s_directml_context->execution_context.get(), reinterpret_cast<uint8_t*>(dstData), size, srcData, bufferRegion.Offset() + offset, srcState);
+    }
 }
 
 static void ggml_backend_directml_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -645,6 +690,13 @@ static void ggml_backend_directml_buffer_init_tensor(ggml_backend_buffer_t buffe
 
     auto* ctx = static_cast<ggml_backend_directml_buffer_context*>(buffer->context);
     tensor->extra = ctx->allocate_extra();
+
+    auto tensor_extra = static_cast<ggml_tensor_extra_directml*>(tensor->extra);
+    if (tensor->type == GGML_TYPE_F32) {
+        tensor_extra->real_data_type = GGML_TYPE_F16;
+    } else {
+        tensor_extra->real_data_type = tensor->type;
+    }
 }
 
 static ggml_backend_buffer_i ggml_backend_directml_buffer_i = {
@@ -724,8 +776,10 @@ static ggml_backend_buffer_type_t ggml_backend_directml_get_default_buffer_type(
     return ggml_backend_directml_buffer_type(ctx->device);
 }
 
-static DML_TENSOR_DATA_TYPE ggml_to_dml_datatype(ggml_type ggml_datatype) {
-    switch (ggml_datatype) {
+static DML_TENSOR_DATA_TYPE ggml_to_dml_datatype(const ggml_tensor* ggml_tensor) {
+    auto tensor_extra = static_cast<ggml_tensor_extra_directml*>(ggml_tensor->extra);
+
+    switch (tensor_extra->real_data_type) {
         case GGML_TYPE_F32: return DML_TENSOR_DATA_TYPE_FLOAT32;
         case GGML_TYPE_F16: return DML_TENSOR_DATA_TYPE_FLOAT16;
         case GGML_TYPE_I32: return DML_TENSOR_DATA_TYPE_INT32;
@@ -772,7 +826,7 @@ static dml::TensorDimensions ggml_to_dml_sizes(const ggml_tensor* ggml_tensor) {
 }
 
 static dml::TensorStrides ggml_to_dml_strides(const ggml_tensor* ggml_tensor) {
-    auto dtype_size = get_data_type_size(ggml_to_dml_datatype(ggml_tensor->type));
+    auto dtype_size = ggml_type_size(ggml_tensor->type);
 
     dml::TensorStrides dml_strides(GGML_MAX_DIMS);
     for (uint32_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
@@ -787,7 +841,7 @@ static dml::TensorStrides ggml_to_dml_strides(const ggml_tensor* ggml_tensor) {
 }
 
 static dml::TensorDesc ggml_to_dml_tensor_desc(const ggml_tensor* ggml_tensor) {
-    auto dml_datatype = ggml_to_dml_datatype(ggml_tensor->type);
+    auto dml_datatype = ggml_to_dml_datatype(ggml_tensor);
     auto dml_sizes = ggml_to_dml_sizes(ggml_tensor);
     auto dml_strides = ggml_to_dml_strides(ggml_tensor);
     auto size_in_bytes = DMLCalcBufferTensorSize(dml_datatype, static_cast<uint32_t>(dml_sizes.size()), dml_sizes.data(), dml_strides.data());
@@ -902,8 +956,6 @@ static dml::Expression create_rmsnorm(dml::Graph& scope, const std::vector<dml::
         static_cast<uint32_t>(original_input_sizes.size() - 1),
     };
 
-    auto input = dml::Cast(node_inputs[0], DML_TENSOR_DATA_TYPE_FLOAT16);
-
     dml::TensorDimensions new_input_sizes({
         original_input_sizes[1],
         original_input_sizes[2],
@@ -911,12 +963,10 @@ static dml::Expression create_rmsnorm(dml::Graph& scope, const std::vector<dml::
         1,
     });
 
-    input = dml::Reinterpret(input, new_input_sizes, NullOpt);
+    auto input = dml::Reinterpret(node_inputs[0], new_input_sizes, NullOpt);
 
     // The input order in GGML is reversed for MatMul
     auto result = dml::MeanVarianceNormalization(input, NullOpt, NullOpt, axes, true, false, epsilon);
-
-    result = dml::Cast(result, DML_TENSOR_DATA_TYPE_FLOAT32);
 
     return result;
 }
@@ -1606,7 +1656,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
 
                         if (!same_a_data || !same_b_data || !same_output_data) {
                             const auto dequantized_tensor_sizes = ggml_to_dml_sizes(node->src[0]);
-                            const auto dequantized_data_type = ggml_to_dml_datatype(node->type);
+                            const auto dequantized_data_type = ggml_to_dml_datatype(node);
                             const auto dequantized_tensor_desc = dml::TensorDesc(dequantized_data_type, dequantized_tensor_sizes);
                             constexpr uint32_t block_size = sizeof(block_q6_K);
                             constexpr uint32_t block_size_without_scale = block_size - sizeof(ggml_fp16_t);
@@ -1667,7 +1717,7 @@ static void update_bindings(ggml_cgraph* cgraph) {
                             auto scale_tensor_sizes = quantized_tensor_sizes;
                             scale_tensor_sizes.back() /= get_quant_block_size(node->src[0]->type);
 
-                            const auto quantized_data_type = ggml_to_dml_datatype(node->src[0]->type);
+                            const auto quantized_data_type = ggml_to_dml_datatype(node->src[0]);
                             auto quantized_tensor_desc = dml::TensorDesc(quantized_data_type, quantized_tensor_sizes);
                             auto scale_tensor_desc = dml::TensorDesc(DML_TENSOR_DATA_TYPE_FLOAT16, scale_tensor_sizes);
 
@@ -2185,7 +2235,7 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                 auto scale_tensor_sizes = quantized_tensor_sizes;
                 scale_tensor_sizes.back() /= get_quant_block_size(node->src[src_index]->type);
 
-                const auto quantized_data_type = ggml_to_dml_datatype(node->src[src_index]->type);
+                const auto quantized_data_type = ggml_to_dml_datatype(node->src[src_index]);
                 input_tensors.push_back(dml::TensorDesc(quantized_data_type, quantized_tensor_sizes));
                 node_inputs.push_back(dml::InputTensor(scope, dml_index++, input_tensors.back()));
 
@@ -2225,11 +2275,11 @@ static bool ggml_backend_directml_graph_compute(ggml_backend_t backend, struct g
                 {
                     if (node->src[0]->type == GGML_TYPE_Q6_K) {
                         const auto dequantized_tensor_sizes = ggml_to_dml_sizes(node->src[0]);
-                        const auto dequantized_data_type = ggml_to_dml_datatype(node->type);
+                        const auto dequantized_data_type = ggml_to_dml_datatype(node);
                         const auto dequantized_tensor_desc = dml::TensorDesc(dequantized_data_type, dequantized_tensor_sizes);
 
                         uint32_t k = static_cast<uint32_t>(node->src[0]->ne[0] * node->src[0]->ne[1]);
-                        auto dequantize_op = create_dequantize_int6(k, ggml_to_dml_datatype(node->type));
+                        auto dequantize_op = create_dequantize_int6(k, ggml_to_dml_datatype(node));
 
                         std::vector<dml::Expression> matmul_inputs = {
                             dml::InputTensor(scope, 0, dequantized_tensor_desc),

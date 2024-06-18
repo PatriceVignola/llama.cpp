@@ -75,7 +75,8 @@ namespace Dml
         uint64_t size,
         ID3D12Resource* src,
         uint64_t srcOffset,
-        D3D12_RESOURCE_STATES srcState)
+        D3D12_RESOURCE_STATES srcState,
+        std::function<void(uint8_t* dstData, const byte* readbackHeapData)> customCopy)
     {
         assert(size != 0);
 
@@ -99,7 +100,13 @@ namespace Dml
         // Map the readback heap and copy it into the destination
         void* readbackHeapData = nullptr;
         THROW_IF_FAILED(m_readbackHeap->Map(0, nullptr, &readbackHeapData));
-        memcpy(dst, readbackHeapData, size);
+
+        if (customCopy) {
+            customCopy(dst, static_cast<byte*>(readbackHeapData));
+        } else {
+            memcpy(dst, readbackHeapData, size);
+        }
+
         m_readbackHeap->Unmap(0, nullptr);
     }
 

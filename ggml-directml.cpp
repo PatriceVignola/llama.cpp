@@ -1276,6 +1276,10 @@ static dml::Expression create_rope(
     ggml_rope_yarn_corr_dims(n_dims, n_orig_ctx, freq_base, beta_fast, beta_slow, corr_dims);
 
     auto input = node_inputs[0];
+
+    // This is a no-op, but it allows us to trigger the RotaryEmbedding fusion in DML
+    input = dml::Identity(input, NullOpt);
+
     auto position_ids = node_inputs[1];
     uint32_t batch_size = input.GetOutputDesc().sizes[0];
     uint32_t seq_len = input.GetOutputDesc().sizes[1];
@@ -1286,6 +1290,10 @@ static dml::Expression create_rope(
     dml::Expression gathered_cos;
     dml::Expression gathered_sin;
     std::tie(gathered_cos, gathered_sin) = generate_cos_sin_caches(scope, position_ids, input.GetOutputDesc(), freq_scale, corr_dims, ext_factor, attn_factor, theta_scale);
+
+    // This is a no-op, but it allows us to trigger the RotaryEmbedding fusion in DML
+    gathered_cos = dml::Gather(gathered_cos, position_ids, 2, 2);
+    gathered_sin = dml::Gather(gathered_sin, position_ids, 2, 2);
 
     auto reshaped_input = dml::Reinterpret(input, dml::TensorDimensions({batch_size, seq_len, num_heads, head_dim / 2, 2}), NullOpt);
 
@@ -1303,6 +1311,11 @@ static dml::Expression create_rope(
 
     auto non_rotated_cos = reshaped_input * gathered_cos;
     auto rotated_sin = rotated_input * gathered_sin * sign_range;
+
+    // Reshape to allow the DML fusion to be triggered
+    non_rotated_cos = dml::Reinterpret(non_rotated_cos, input.GetOutputDesc().sizes, NullOpt);
+    rotated_sin = dml::Reinterpret(rotated_sin, input.GetOutputDesc().sizes, NullOpt);
+
     auto result = non_rotated_cos + rotated_sin;
     result = dml::Reinterpret(result, output_tensor_desc.sizes, output_tensor_desc.strides);
     return result;

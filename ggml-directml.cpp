@@ -670,6 +670,8 @@ static void ggml_backend_directml_buffer_get_tensor(ggml_backend_buffer_t buffer
             }
         };
 
+        // TODO (pavignol): Find a better way to get the correct size/offset. This essentially a hack that assumes that the provided sizes and offsets have
+        // been calculated by multiplying sizeof(float).
         s_directml_context->readback_heap.ReadbackFromGpu(s_directml_context->execution_context.get(), reinterpret_cast<uint8_t*>(dstData), size / 2, srcData, bufferRegion.Offset() + offset / 2, srcState, preprocess);
     } else {
         s_directml_context->readback_heap.ReadbackFromGpu(s_directml_context->execution_context.get(), reinterpret_cast<uint8_t*>(dstData), size, srcData, bufferRegion.Offset() + offset, srcState);

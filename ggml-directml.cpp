@@ -1187,7 +1187,7 @@ static std::tuple<dml::Expression, dml::Expression> rope_yarn(
     auto theta_interp = freq_scale * theta_extrap;
     auto theta = theta_interp;
     if (ext_factor != 0.0f) {
-        auto pos_range = sequence_tensor(scope, 0, 2, DML_TENSOR_DATA_TYPE_FLOAT32, theta_extrap.GetOutputDesc().sizes);
+        auto pos_range = sequence_tensor(scope, 0, 2, DML_TENSOR_DATA_TYPE_FLOAT16, theta_extrap.GetOutputDesc().sizes);
         auto ramp_mix = rope_yarn_ramp(scope, corr_dims[0], corr_dims[1], pos_range) * ext_factor;
         theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
 
@@ -1214,8 +1214,8 @@ static std::tuple<dml::Expression, dml::Expression> generate_cos_sin_caches(
     dml::TensorDimensions pos_range_sizes(input_desc.sizes.size(), 1);
     pos_range_sizes.back() = input_desc.sizes.back() / 2;
 
-    auto dml_theta_scale = scalar_tensor(scope, theta_scale, DML_TENSOR_DATA_TYPE_FLOAT32, pos_range_sizes);
-    auto exp_range = sequence_tensor(scope, 0, 1, DML_TENSOR_DATA_TYPE_FLOAT32, pos_range_sizes);
+    auto dml_theta_scale = scalar_tensor(scope, theta_scale, DML_TENSOR_DATA_TYPE_FLOAT16, pos_range_sizes);
+    auto exp_range = sequence_tensor(scope, 0, 1, DML_TENSOR_DATA_TYPE_FLOAT16, pos_range_sizes);
     auto exp = dml::Pow(dml_theta_scale, exp_range);
     position_ids = dml::Cast(position_ids, exp.GetOutputDesc().dataType);
     auto theta = dml::Gemm(position_ids, exp, NullOpt, DML_MATRIX_TRANSFORM_TRANSPOSE, DML_MATRIX_TRANSFORM_NONE);

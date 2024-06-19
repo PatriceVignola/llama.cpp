@@ -1563,15 +1563,15 @@ static void update_bindings(ggml_cgraph* cgraph) {
             case dml_fusion_type::group_query_attention:
             {
                 auto fusion = static_cast<dml_gqa_fusion*>(node_extra->fusion.get());
-                bool same_query_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == fusion->query_tensor;
-                bool same_key_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(1) == fusion->key_tensor;
-                bool same_value_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(2) == fusion->value_tensor;
+                bool same_query_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(0) == fusion->query_tensor->data;
+                bool same_key_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(1) == fusion->key_tensor->data;
+                bool same_value_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(2) == fusion->value_tensor->data;
 
                 auto sequence_length = fusion->query_tensor->ne[2];
-                bool same_mask_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(3) == fusion->mask_tensor;
-                bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == fusion->output_tensor;
-                bool same_output_present_key_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(1) == fusion->present_key_tensor;
-                bool same_output_present_value_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(2) == fusion->present_value_tensor;
+                bool same_mask_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawInputData(3) == fusion->mask_tensor->data;
+                bool same_output_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(0) == fusion->output_tensor->data;
+                bool same_output_present_key_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(1) == fusion->present_key_tensor->data;
+                bool same_output_present_value_data = s_directml_context->reused_command_list_state.operators[dml_operator_index]->GetRawOutputData(2) == fusion->present_value_tensor->data;
 
                 if (!same_query_data || !same_key_data || !same_value_data || !same_mask_data || !same_output_data || !same_output_present_key_data || !same_output_present_value_data) {
                     std::vector<Dml::D3D12BufferRegion> input_buffer_regions({

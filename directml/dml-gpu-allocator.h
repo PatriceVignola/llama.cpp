@@ -26,7 +26,7 @@ namespace Dml
         void* Alloc(size_t sizeInBytes);
         void* Alloc(size_t sizeInBytes, AllocatorRoundingMode roundingMode);
         void Free(void* ptr);
-        D3D12BufferRegion CreateBufferRegion(const void* opaquePointer, uint64_t sizeInBytes);
+        D3D12BufferRegion CreateBufferRegion(const void* opaquePointer, uint64_t sizeInBytes) const;
         AllocationInfo* GetAllocationInfo(void* opaquePointer);
         void SetDefaultRoundingMode(AllocatorRoundingMode roundingMode);
         DmlBuffer AllocateDefaultBuffer(uint64_t num_bytes);

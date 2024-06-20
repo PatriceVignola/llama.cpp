@@ -29,7 +29,7 @@ namespace Dml
         m_bfcSubAllocator->Free(ptr);
     }
 
-    D3D12BufferRegion DmlGpuAllocator::CreateBufferRegion(const void* opaquePointer, uint64_t sizeInBytes)
+    D3D12BufferRegion DmlGpuAllocator::CreateBufferRegion(const void* opaquePointer, uint64_t sizeInBytes) const
     {
         return m_bfcSubAllocator->CreateBufferRegion(opaquePointer, sizeInBytes);
     }

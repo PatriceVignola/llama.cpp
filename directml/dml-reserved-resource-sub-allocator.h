@@ -45,7 +45,6 @@ namespace Dml
 
         DmlReservedResourceSubAllocator(
             ID3D12Device* device,
-            std::shared_ptr<ExecutionContext> context,
             ID3D12CommandQueue* queue,
             const D3D12_HEAP_PROPERTIES& heapProps,
             D3D12_HEAP_FLAGS heapFlags,
@@ -59,7 +58,7 @@ namespace Dml
         // the ID3D12Resource is cached, so this call typically has a lower cost
         // than a call to ID3D12Device::CreatePlacedResource or
         // CreateReservedResource.
-        D3D12BufferRegion CreateBufferRegion(const void* opaquePointer, uint64_t sizeInBytes);
+        D3D12BufferRegion CreateBufferRegion(const void* opaquePointer, uint64_t sizeInBytes) const;
 
         AllocationInfo* GetAllocationInfo(void* opaquePointer);
 
@@ -67,13 +66,6 @@ namespace Dml
         uint64_t ComputeRequiredSize(size_t size);
         bool TilingEnabled() const { return m_tilingEnabled; };
         uint64_t GetUniqueId(void* opaquePointer);
-
-        // Constructs a DmlReservedResourceSubAllocator which allocates D3D12 committed resources with the specified heap properties,
-        // resource flags, and initial resource state.
-        DmlReservedResourceSubAllocator(
-            ID3D12Device* device,
-            std::shared_ptr<ExecutionContext> context,
-            std::unique_ptr<DmlReservedResourceSubAllocator>&& subAllocator);
 
         void* Alloc(size_t size);
         void Free(void* p);
@@ -105,10 +97,9 @@ namespace Dml
         uint64_t m_currentResourceId = 0;
         std::unique_ptr<DmlReservedResourceSubAllocator> m_subAllocator;
 
-        std::mutex m_mutex;
+        mutable std::mutex m_mutex;
 
         Microsoft::WRL::ComPtr<ID3D12Device> m_device;
-        std::shared_ptr<ExecutionContext> m_context;
         Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_queue;
         const D3D12_HEAP_PROPERTIES m_heapProperties;
         const D3D12_HEAP_FLAGS m_heapFlags;

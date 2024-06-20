@@ -47,14 +47,12 @@ namespace Dml
 
     DmlReservedResourceSubAllocator::DmlReservedResourceSubAllocator(
         ID3D12Device* device,
-        std::shared_ptr<ExecutionContext> context,
         ID3D12CommandQueue* queue,
         const D3D12_HEAP_PROPERTIES& heapProps,
         D3D12_HEAP_FLAGS heapFlags,
         D3D12_RESOURCE_FLAGS resourceFlags,
         D3D12_RESOURCE_STATES initialState)
         : m_device(device),
-        m_context(context),
         m_queue(queue),
         m_heapProperties(heapProps),
         m_heapFlags(heapFlags),
@@ -254,17 +252,12 @@ namespace Dml
 
     void DmlReservedResourceSubAllocator::FreeResource(AllocationInfo* allocInfo, uint64_t resourceId)
     {
-        // Since this allocator is warapped by ORT's BFC allocator, it's possible that the context is already
-        // close at this point if the application is winding down.
-        if (!m_context->Closed())
-        {
-            assert(allocInfo != nullptr); // Can't free nullptr
+        assert(allocInfo != nullptr); // Can't free nullptr
 
-            if (allocInfo->GetOwner() != this)
-            {
-                // This allocation doesn't belong to this allocator!
-                THROW_HR(E_INVALIDARG);
-            }
+        if (allocInfo->GetOwner() != this)
+        {
+            // This allocation doesn't belong to this allocator!
+            THROW_HR(E_INVALIDARG);
         }
     }
 
@@ -301,9 +294,7 @@ namespace Dml
         m_freeAllocationIds.push_back(id);
     }
 
-    D3D12BufferRegion DmlReservedResourceSubAllocator::CreateBufferRegion(
-        const void* opaquePointer,
-        uint64_t sizeInBytes)
+    D3D12BufferRegion DmlReservedResourceSubAllocator::CreateBufferRegion(const void* opaquePointer, uint64_t sizeInBytes) const
     {
         auto taggedPointer = TaggedPointer::Unpack(opaquePointer);
 
